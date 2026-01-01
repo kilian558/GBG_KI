@@ -104,7 +104,7 @@ async def log_debug(msg: str, channel_id: int = None):
 async def create_http_session():
     global http_session
     connector = aiohttp.TCPConnector(ssl=False)
-    timeout = aiohttp.ClientTimeout(total=30)
+    timeout = aiohttp.ClientTimeout(total=60)  # Länger für Grok
     http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
 
@@ -147,6 +147,7 @@ class IngameNameOrIdModal(Modal):
         await interaction.response.send_message(f"Danke! Verarbeite jetzt '{user_input}'...", ephemeral=False)
 
         possible_id = extract_player_id(user_input)
+        found = False
         if possible_id:
             if possible_id != ticket_player_id[self.channel_id]:
                 ticket_player_id[self.channel_id] = possible_id
@@ -154,12 +155,26 @@ class IngameNameOrIdModal(Modal):
                 await update_escalation_embed(self.channel_id)
                 ticket_history[self.channel_id].append({
                     "role": "system",
-                    "content": f"User hat Steam-ID per Modal angegeben: {possible_id}"
+                    "content": f"User hat Steam-ID per Modal angegeben: {possible_id}. Player-Info wird geladen."
                 })
                 await add_player_info_to_history(self.channel_id)
+                found = True
         else:
-            await search_and_set_best_player_id(self.channel_id, name=user_input)
+            found = await search_and_set_best_player_id(self.channel_id, name=user_input)
+            if found:
+                ticket_history[self.channel_id].append({
+                    "role": "system",
+                    "content": f"Name '{user_input}' per Modal verarbeitet – Player-ID gefunden."
+                })
+                await add_player_info_to_history(self.channel_id)
 
+        if not found:
+            ticket_history[self.channel_id].append({
+                "role": "system",
+                "content": f"Verarbeitung von '{user_input}' per Modal fehlgeschlagen – kein Player gefunden. User muss korrekten Namen/ID angeben."
+            })
+
+        # Debounce nach Modal
         if self.channel_id in pending_response_task:
             pending_response_task[self.channel_id].cancel()
         pending_response_task[self.channel_id] = asyncio.create_task(
@@ -280,10 +295,10 @@ class TicketAdminView(View):
             await interaction.response.send_message("Konnte Infos nicht senden.", ephemeral=True)
 
 
-# === PLAYER-SUCHE ===
-async def search_and_set_best_player_id(channel_id: int, name: str = None):
+# === PLAYER-SUCHE (mit return found) ===
+async def search_and_set_best_player_id(channel_id: int, name: str = None) -> bool:
     if not name or not http_session:
-        return
+        return False
     try:
         async with http_session.get(
                 f"{API_BASE_URL}/get_players_history",
@@ -297,7 +312,7 @@ async def search_and_set_best_player_id(channel_id: int, name: str = None):
         ) as resp:
             if resp.status != 200:
                 await log_debug(f"Name-Suche Status {resp.status}", channel_id)
-                return
+                return False
             data = await resp.json()
             players_wrapper = data.get("result", {})
             players = players_wrapper.get("players", []) if isinstance(players_wrapper, dict) else []
@@ -307,7 +322,7 @@ async def search_and_set_best_player_id(channel_id: int, name: str = None):
                     "role": "system",
                     "content": f"Name-Suche für '{name}' hat keinen passenden Player gefunden. Möglicherweise falsche Schreibweise oder Clan-Tag."
                 })
-                return
+                return False
 
             def get_max_last_seen(player):
                 names = player.get("names", [])
@@ -334,10 +349,13 @@ async def search_and_set_best_player_id(channel_id: int, name: str = None):
                         "role": "system",
                         "content": f"Beste Player-ID zu Name '{name}' gefunden: {best_id}"
                     })
+                    return True
     except Exception as e:
         await log_debug(f"Player-Suche Exception: {e}", channel_id)
+    return False
 
 
+# === PLAYER-INFO LADEN (robuster & detaillierter) ===
 async def add_player_info_to_history(channel_id: int):
     player_id = ticket_player_id[channel_id]
     if not player_id or ticket_player_info_added[channel_id] or not http_session:
@@ -346,47 +364,53 @@ async def add_player_info_to_history(channel_id: int):
         async with http_session.get(
                 f"{API_BASE_URL}/get_players_history",
                 headers=API_HEADERS,
-                params={"player_id": player_id, "page_size": 20}
+                params={"player_id": player_id, "page_size": 30}  # Mehr für besseren Kontext
         ) as resp:
             if resp.status != 200:
                 await log_debug(f"Player-Info Abruf Status {resp.status}", channel_id)
+                ticket_history[channel_id].append({
+                    "role": "system",
+                    "content": f"Player-Info für ID {player_id} konnte nicht abgerufen werden (Status {resp.status})."
+                })
                 return
             data = await resp.json()
             punishments = data.get("result", [])
             if not isinstance(punishments, list):
                 punishments = []
+                await log_debug("Punishments ist keine Liste – unerwartetes API-Format", channel_id)
 
-            # Vollständige Info für KI (JSON)
-            if punishments:
-                limited = punishments[:10]
-                full_summary = f"Spieler-Info (ID {player_id}): Letzte Aktivitäten/Punishments (neueste zuerst): {json.dumps(limited, ensure_ascii=False, default=str)}"
-            else:
-                full_summary = f"Spieler-Info (ID {player_id}): Keine Punishments oder Daten verfügbar."
+            # Vollständige JSON-Info für KI
+            limited = punishments[:15]
+            full_summary = f"Spieler-Info für ID {player_id} (letzte 15 Einträge): {json.dumps(limited, ensure_ascii=False, default=str)}"
             ticket_history[channel_id].append({"role": "system", "content": full_summary})
 
-            # Natürliche Summary für letzten Ban/Blacklist/Temp-Ban
+            # Detaillierte Ban-Summary
             ban_entries = [p for p in punishments if
                            p.get("action", "").lower() in ["ban", "temp_ban", "perma_ban", "permanent_ban", "blacklist",
-                                                           "unblacklist_player"]]
+                                                           "remove_temp_ban", "unban", "unblacklist_player"]]
             if ban_entries:
-                latest = ban_entries[0]  # Annahme: API sortiert neueste zuerst
-                action = latest.get("action", "Ban")
+                latest = ban_entries[0]
+                action = latest.get("action", "Unbekannt")
                 reason = latest.get("reason", "kein Grund angegeben")
                 timestamp = latest.get("timestamp", "unbekannt")
                 by = latest.get("by", "unbekannt")
-                ban_summary = f"Letzter Punishment: {action} wegen '{reason}' am {timestamp} von {by}. Erzähl mal deine Seite davon!"
+                ban_summary = f"Aktueller/letzter Ban-Status: {action} wegen '{reason}' am {timestamp} von {by}. Alle Ban-Einträge sind in der vollständigen Info oben."
             else:
-                ban_summary = "Kein Ban/Blacklist gefunden – vielleicht nur Warnings oder alte Einträge."
+                ban_summary = "Keine Ban- oder Blacklist-Einträge gefunden – möglicherweise nur Warnings oder keine Punishments."
 
             ticket_history[channel_id].append({"role": "system", "content": ban_summary})
 
             ticket_player_info_added[channel_id] = True
-            await log_debug("Player-Info + detaillierte Ban-Summary zur KI-History hinzugefügt", channel_id)
+            await log_debug("Player-Info + Ban-Summary erfolgreich zur KI-History hinzugefügt", channel_id)
     except Exception as e:
-        await log_debug(f"Player-Info Abruf Exception: {e}", channel_id)
+        await log_debug(f"Player-Info Exception: {e}", channel_id)
+        ticket_history[channel_id].append({
+            "role": "system",
+            "content": f"Fehler beim Laden der Player-Info für ID {player_id}: {str(e)}"
+        })
 
 
-# === EMBED AKTUALISIEREN ===
+# === EMBED AKTUALISIEREN (mit mehr Details) ===
 async def update_escalation_embed(channel_id: int, summary: str = None):
     admin_channel = bot.get_channel(ADMIN_SUMMARY_CHANNEL_ID)
     if not admin_channel:
@@ -421,11 +445,12 @@ async def update_escalation_embed(channel_id: int, summary: str = None):
                             punishments = []
                         if punishments:
                             pun_str = "\n".join([
-                                                    f"{p.get('action', 'Unknown')} ({p.get('reason', 'N/A')}) am {p.get('timestamp', 'N/A')}"
+                                                    f"{p.get('action', 'Unknown')} ({p.get('reason', 'N/A')}) am {p.get('timestamp', 'N/A')} von {p.get('by', 'N/A')}"
                                                     for p in punishments[:5]])
-                            embed.add_field(name="Letzte Punishments", value=pun_str, inline=False)
+                            embed.add_field(name="Letzte Punishments (mit Grund)", value=pun_str or "Keine Details",
+                                            inline=False)
                         else:
-                            embed.add_field(name="Letzte Punishments", value="Keine", inline=False)
+                            embed.add_field(name="Letzte Punishments", value="Keine gefunden", inline=False)
         except Exception as e:
             await log_debug(f"Eskalation Player-Info Fehler: {e}", channel_id)
     msg = ticket_escalation_message[channel_id]
@@ -465,7 +490,7 @@ def has_admin_role(member: discord.Member) -> bool:
     return any(role.name == ADMIN_ROLE_NAME for role in member.roles)
 
 
-# === KI-ANTWORT ===
+# === KI-ANTWORT (mit besserem Error-Handling) ===
 async def send_ki_response(channel: discord.TextChannel, channel_id: int):
     if ticket_closed[channel_id] or admin_active[channel_id] or not http_session:
         return
@@ -483,7 +508,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
         payload = {
             "model": "grok-4",
             "messages": messages_for_api,
-            "max_tokens": 400,
+            "max_tokens": 500,  # Mehr Tokens für komplexere Antworten mit Ban-Infos
             "temperature": 0.8
         }
         async with http_session.post("https://api.x.ai/v1/chat/completions", json=payload,
@@ -491,7 +516,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             if response.status != 200:
                 resp_text = await response.text()
                 await log_debug(f"KI-API Fehler: {response.status} – {resp_text}", channel_id)
-                await channel.send("Momentan technische Probleme bei mir – gleich wieder da! 😅")
+                await channel.send("Momentan technische Probleme bei der KI – gleich wieder da! 😅")
                 return
             data = await response.json()
             bot_reply = data["choices"][0]["message"]["content"].strip()
@@ -543,9 +568,11 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
         if ticket_player_id[channel_id] and name_modal_sent[channel_id]:
             name_modal_sent[channel_id] = False
 
+    except asyncio.CancelledError:
+        pass  # Debounce-Cancel – normal
     except Exception as e:
         await log_debug(f"KI-Exception: {e}", channel_id)
-        await channel.send("Ups, da ist was schiefgelaufen. Versuch’s nochmal oder frag einen Admin! 🙈")
+        await channel.send("Ups, da ist was schiefgelaufen bei der KI. Versuch’s nochmal oder frag einen Admin! 🙈")
 
 
 # === FEEDBACK NACH CLOSE ===
@@ -576,7 +603,7 @@ async def on_reaction_add(reaction, user):
 @bot.event
 async def on_ready():
     await create_http_session()
-    await log_debug("Bot online – mit verbessertem Punishment-Parsing & KI-Zugriff auf Ban-Gründe!")
+    await log_debug("Bot online – mit robustem Punishment-Zugriff, Modal-Fehler-Handling & Debouncing!")
 
 
 @bot.event
@@ -658,8 +685,8 @@ async def on_message(message):
             id_changed = True
 
         if ingame_name:
-            await search_and_set_best_player_id(channel_id, name=ingame_name)
-            if ticket_player_id[channel_id] and not id_changed:
+            found = await search_and_set_best_player_id(channel_id, name=ingame_name)
+            if found and not id_changed:
                 id_changed = True
 
         if id_changed:

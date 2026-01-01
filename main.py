@@ -57,6 +57,7 @@ ticket_player_info_added = defaultdict(bool)
 admin_active = defaultdict(bool)
 ticket_escalation_message = defaultdict(lambda: None)
 name_modal_sent = defaultdict(bool)
+pending_response_task = defaultdict(lambda: None)
 
 # Globale aiohttp Session
 http_session: aiohttp.ClientSession | None = None
@@ -114,6 +115,14 @@ async def close_http_session():
         http_session = None
 
 
+# === DEBOUNCED KI-RESPONSE ===
+async def debounced_ki_response(channel: discord.TextChannel, channel_id: int):
+    await asyncio.sleep(5)
+    if channel_id in pending_response_task:
+        del pending_response_task[channel_id]
+    await send_ki_response(channel, channel_id)
+
+
 # === MODAL & VIEW FÜR NAME/ID-INPUT ===
 class IngameNameOrIdModal(Modal):
     def __init__(self, channel_id: int):
@@ -151,9 +160,10 @@ class IngameNameOrIdModal(Modal):
         else:
             await search_and_set_best_player_id(self.channel_id, name=user_input)
 
-        channel = bot.get_channel(self.channel_id)
-        if channel:
-            await send_ki_response(channel, self.channel_id)
+        if self.channel_id in pending_response_task:
+            pending_response_task[self.channel_id].cancel()
+        pending_response_task[self.channel_id] = asyncio.create_task(
+            debounced_ki_response(interaction.channel, self.channel_id))
 
 
 class NameRequestView(View):
@@ -227,7 +237,7 @@ async def api_clear_full_bans(player_id: str, channel_id: int):
     return success
 
 
-# === ADMIN VIEW MIT UNBAN-BUTTON ===
+# === ADMIN VIEW MIT UNBAN-BUTTON (DM-Fallback) ===
 class TicketAdminView(View):
     def __init__(self, player_id: str, ticket_channel: discord.TextChannel, channel_id: int):
         super().__init__(timeout=None)
@@ -257,14 +267,17 @@ class TicketAdminView(View):
         summary = "Ticket-Konversation (letzte 20):\n\n"
         for msg in ticket_history[self.channel_id][-20:]:
             role = msg["role"]
-            content = msg["content"]
+            content = msg["content"] if isinstance(msg["content"], str) else "[Multimodal/Nachricht mit Anhang]"
             prefix = "User" if role == "user" else "Bot"
             summary += f"{prefix}: {content}\n\n"
         try:
             await interaction.user.send(f"Infos zum Ticket {self.ticket_channel.mention}:\n{summary}")
             await interaction.response.send_message("Infos per DM gesendet!", ephemeral=True)
-        except:
-            await interaction.response.send_message("Konnte DM nicht senden.", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(f"DM nicht möglich – Infos hier (nur du siehst's):\n{summary}",
+                                                    ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("Konnte Infos nicht senden.", ephemeral=True)
 
 
 # === PLAYER-SUCHE ===
@@ -343,27 +356,32 @@ async def add_player_info_to_history(channel_id: int):
             if not isinstance(punishments, list):
                 punishments = []
 
+            # Vollständige Info für KI (JSON)
             if punishments:
                 limited = punishments[:10]
-                full_summary = f"Spieler-Info (ID {player_id}): Letzte Aktivitäten/Punishments: {json.dumps(limited, ensure_ascii=False, default=str)}"
+                full_summary = f"Spieler-Info (ID {player_id}): Letzte Aktivitäten/Punishments (neueste zuerst): {json.dumps(limited, ensure_ascii=False, default=str)}"
             else:
-                full_summary = f"Spieler-Info (ID {player_id}): Keine Punishments/Daten verfügbar."
+                full_summary = f"Spieler-Info (ID {player_id}): Keine Punishments oder Daten verfügbar."
             ticket_history[channel_id].append({"role": "system", "content": full_summary})
 
-            ban_punishments = [p for p in punishments if 'ban' in p.get('action', '').lower()]
-            if ban_punishments:
-                latest_ban = ban_punishments[0]
-                action = latest_ban.get('action', 'Ban')
-                reason = latest_ban.get('reason', 'kein Grund angegeben')
-                timestamp = latest_ban.get('timestamp', 'unbekannt')
-                ban_summary = f"Aktueller Ban: {action} wegen '{reason}' am {timestamp}. Erzähl mal deine Seite davon!"
+            # Natürliche Summary für letzten Ban/Blacklist/Temp-Ban
+            ban_entries = [p for p in punishments if
+                           p.get("action", "").lower() in ["ban", "temp_ban", "perma_ban", "permanent_ban", "blacklist",
+                                                           "unblacklist_player"]]
+            if ban_entries:
+                latest = ban_entries[0]  # Annahme: API sortiert neueste zuerst
+                action = latest.get("action", "Ban")
+                reason = latest.get("reason", "kein Grund angegeben")
+                timestamp = latest.get("timestamp", "unbekannt")
+                by = latest.get("by", "unbekannt")
+                ban_summary = f"Letzter Punishment: {action} wegen '{reason}' am {timestamp} von {by}. Erzähl mal deine Seite davon!"
             else:
-                ban_summary = "Kein aktueller Ban gefunden – vielleicht nur Temp oder Warning?"
+                ban_summary = "Kein Ban/Blacklist gefunden – vielleicht nur Warnings oder alte Einträge."
 
             ticket_history[channel_id].append({"role": "system", "content": ban_summary})
 
             ticket_player_info_added[channel_id] = True
-            await log_debug("Player-Info + Banngrund-Summary zur KI-History hinzugefügt", channel_id)
+            await log_debug("Player-Info + detaillierte Ban-Summary zur KI-History hinzugefügt", channel_id)
     except Exception as e:
         await log_debug(f"Player-Info Abruf Exception: {e}", channel_id)
 
@@ -402,8 +420,9 @@ async def update_escalation_embed(channel_id: int, summary: str = None):
                         if not isinstance(punishments, list):
                             punishments = []
                         if punishments:
-                            pun_str = "\n".join([f"{p.get('action', 'Unknown')} am {p.get('timestamp', 'N/A')}" for p in
-                                                 punishments[:5]])
+                            pun_str = "\n".join([
+                                                    f"{p.get('action', 'Unknown')} ({p.get('reason', 'N/A')}) am {p.get('timestamp', 'N/A')}"
+                                                    for p in punishments[:5]])
                             embed.add_field(name="Letzte Punishments", value=pun_str, inline=False)
                         else:
                             embed.add_field(name="Letzte Punishments", value="Keine", inline=False)
@@ -446,19 +465,18 @@ def has_admin_role(member: discord.Member) -> bool:
     return any(role.name == ADMIN_ROLE_NAME for role in member.roles)
 
 
-# === KI-ANTWORT (mit Bild-Support) ===
+# === KI-ANTWORT ===
 async def send_ki_response(channel: discord.TextChannel, channel_id: int):
     if ticket_closed[channel_id] or admin_active[channel_id] or not http_session:
         return
 
-    # History für API vorbereiten – unterstützt multimodale Inhalte
     messages_for_api = []
     for msg in ticket_history[channel_id]:
         if msg["role"] == "system":
             messages_for_api.append({"role": "system", "content": msg["content"]})
         elif isinstance(msg["content"], str):
             messages_for_api.append({"role": msg["role"], "content": msg["content"]})
-        elif isinstance(msg["content"], list):  # Multimodal (Text + Bilder)
+        elif isinstance(msg["content"], list):
             messages_for_api.append({"role": msg["role"], "content": msg["content"]})
 
     try:
@@ -558,7 +576,7 @@ async def on_reaction_add(reaction, user):
 @bot.event
 async def on_ready():
     await create_http_session()
-    await log_debug("Bot online – mit Bild-Analyse (Screenshots lesen) und allen Features!")
+    await log_debug("Bot online – mit verbessertem Punishment-Parsing & KI-Zugriff auf Ban-Gründe!")
 
 
 @bot.event
@@ -611,32 +629,28 @@ async def on_message(message):
 
         await log_debug(f"Owner-Nachricht in Ticket {channel_id}: {message.content[:100]}", channel_id)
 
-        # Multimodale User-Message vorbereiten
         user_content = []
         if message.content:
             user_content.append({"type": "text", "text": message.content})
 
-        # Bilder (Anhänge) hinzufügen – nur Images
         for attachment in message.attachments:
             if attachment.content_type and attachment.content_type.startswith("image/"):
                 user_content.append({
                     "type": "image_url",
                     "image_url": {"url": attachment.url}
                 })
-                await log_debug(f"Bild angehängt und zur History hinzugefügt: {attachment.filename}", channel_id)
+                await log_debug(f"Bild angehängt: {attachment.filename}", channel_id)
 
-        # Wenn kein Text aber Bilder → Hinweis-Text für Kontext
         if not message.content and user_content:
             user_content.insert(0, {"type": "text", "text": "User hat einen Screenshot hochgeladen:"})
 
-        # In History speichern (multimodal)
         if user_content:
             ticket_history[channel_id].append({"role": "user", "content": user_content})
         else:
             ticket_history[channel_id].append({"role": "user", "content": message.content})
 
-        direct_id = extract_player_id(message.content)
-        ingame_name = extract_ingame_name(message.content)
+        direct_id = extract_player_id(message.content or "")
+        ingame_name = extract_ingame_name(message.content or "")
         id_changed = False
 
         if direct_id and direct_id != ticket_player_id[channel_id]:
@@ -654,7 +668,9 @@ async def on_message(message):
 
         await add_player_info_to_history(channel_id)
 
-        await send_ki_response(message.channel, channel_id)
+        if channel_id in pending_response_task:
+            pending_response_task[channel_id].cancel()
+        pending_response_task[channel_id] = asyncio.create_task(debounced_ki_response(message.channel, channel_id))
 
         if ticket_closed[channel_id]:
             await send_feedback_message(message.channel)

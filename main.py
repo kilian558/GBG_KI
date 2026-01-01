@@ -104,7 +104,7 @@ async def log_debug(msg: str, channel_id: int = None):
 async def create_http_session():
     global http_session
     connector = aiohttp.TCPConnector(ssl=False)
-    timeout = aiohttp.ClientTimeout(total=60)  # Länger für Grok
+    timeout = aiohttp.ClientTimeout(total=60)
     http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
 
@@ -174,7 +174,6 @@ class IngameNameOrIdModal(Modal):
                 "content": f"Verarbeitung von '{user_input}' per Modal fehlgeschlagen – kein Player gefunden. User muss korrekten Namen/ID angeben."
             })
 
-        # Debounce nach Modal
         if self.channel_id in pending_response_task:
             pending_response_task[self.channel_id].cancel()
         pending_response_task[self.channel_id] = asyncio.create_task(
@@ -252,7 +251,7 @@ async def api_clear_full_bans(player_id: str, channel_id: int):
     return success
 
 
-# === ADMIN VIEW MIT UNBAN-BUTTON (DM-Fallback) ===
+# === ADMIN VIEW MIT UNBAN-BUTTON (verbesserter Fallback) ===
 class TicketAdminView(View):
     def __init__(self, player_id: str, ticket_channel: discord.TextChannel, channel_id: int):
         super().__init__(timeout=None)
@@ -279,23 +278,24 @@ class TicketAdminView(View):
 
     @discord.ui.button(label="Ticket-Infos anzeigen", style=discord.ButtonStyle.primary)
     async def show_infos(self, interaction: discord.Interaction, button: Button):
-        summary = "Ticket-Konversation (letzte 20):\n\n"
-        for msg in ticket_history[self.channel_id][-20:]:
+        summary = "Ticket-Konversation (letzte 30 Nachrichten):\n\n"
+        history = ticket_history[self.channel_id][-30:]
+        for msg in history:
             role = msg["role"]
-            content = msg["content"] if isinstance(msg["content"], str) else "[Multimodal/Nachricht mit Anhang]"
+            content = msg["content"] if isinstance(msg["content"], str) else "[Nachricht mit Bild/Anhang]"
             prefix = "User" if role == "user" else "Bot"
             summary += f"{prefix}: {content}\n\n"
         try:
             await interaction.user.send(f"Infos zum Ticket {self.ticket_channel.mention}:\n{summary}")
             await interaction.response.send_message("Infos per DM gesendet!", ephemeral=True)
         except discord.Forbidden:
-            await interaction.response.send_message(f"DM nicht möglich – Infos hier (nur du siehst's):\n{summary}",
+            await interaction.response.send_message(f"DM blockiert – Infos hier (nur du siehst's):\n{summary}",
                                                     ephemeral=True)
-        except Exception:
-            await interaction.response.send_message("Konnte Infos nicht senden.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"Fehler beim Senden der Infos: {str(e)}", ephemeral=True)
 
 
-# === PLAYER-SUCHE (mit return found) ===
+# === PLAYER-SUCHE (return bool) ===
 async def search_and_set_best_player_id(channel_id: int, name: str = None) -> bool:
     if not name or not http_session:
         return False
@@ -355,7 +355,7 @@ async def search_and_set_best_player_id(channel_id: int, name: str = None) -> bo
     return False
 
 
-# === PLAYER-INFO LADEN (robuster & detaillierter) ===
+# === PLAYER-INFO LADEN (robust & detailliert) ===
 async def add_player_info_to_history(channel_id: int):
     player_id = ticket_player_id[channel_id]
     if not player_id or ticket_player_info_added[channel_id] or not http_session:
@@ -364,7 +364,7 @@ async def add_player_info_to_history(channel_id: int):
         async with http_session.get(
                 f"{API_BASE_URL}/get_players_history",
                 headers=API_HEADERS,
-                params={"player_id": player_id, "page_size": 30}  # Mehr für besseren Kontext
+                params={"player_id": player_id, "page_size": 30}
         ) as resp:
             if resp.status != 200:
                 await log_debug(f"Player-Info Abruf Status {resp.status}", channel_id)
@@ -379,12 +379,10 @@ async def add_player_info_to_history(channel_id: int):
                 punishments = []
                 await log_debug("Punishments ist keine Liste – unerwartetes API-Format", channel_id)
 
-            # Vollständige JSON-Info für KI
             limited = punishments[:15]
             full_summary = f"Spieler-Info für ID {player_id} (letzte 15 Einträge): {json.dumps(limited, ensure_ascii=False, default=str)}"
             ticket_history[channel_id].append({"role": "system", "content": full_summary})
 
-            # Detaillierte Ban-Summary
             ban_entries = [p for p in punishments if
                            p.get("action", "").lower() in ["ban", "temp_ban", "perma_ban", "permanent_ban", "blacklist",
                                                            "remove_temp_ban", "unban", "unblacklist_player"]]
@@ -410,7 +408,7 @@ async def add_player_info_to_history(channel_id: int):
         })
 
 
-# === EMBED AKTUALISIEREN (mit mehr Details) ===
+# === EMBED AKTUALISIEREN ===
 async def update_escalation_embed(channel_id: int, summary: str = None):
     admin_channel = bot.get_channel(ADMIN_SUMMARY_CHANNEL_ID)
     if not admin_channel:
@@ -490,7 +488,7 @@ def has_admin_role(member: discord.Member) -> bool:
     return any(role.name == ADMIN_ROLE_NAME for role in member.roles)
 
 
-# === KI-ANTWORT (mit besserem Error-Handling) ===
+# === KI-ANTWORT ===
 async def send_ki_response(channel: discord.TextChannel, channel_id: int):
     if ticket_closed[channel_id] or admin_active[channel_id] or not http_session:
         return
@@ -508,7 +506,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
         payload = {
             "model": "grok-4",
             "messages": messages_for_api,
-            "max_tokens": 500,  # Mehr Tokens für komplexere Antworten mit Ban-Infos
+            "max_tokens": 500,
             "temperature": 0.8
         }
         async with http_session.post("https://api.x.ai/v1/chat/completions", json=payload,
@@ -569,7 +567,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             name_modal_sent[channel_id] = False
 
     except asyncio.CancelledError:
-        pass  # Debounce-Cancel – normal
+        pass
     except Exception as e:
         await log_debug(f"KI-Exception: {e}", channel_id)
         await channel.send("Ups, da ist was schiefgelaufen bei der KI. Versuch’s nochmal oder frag einen Admin! 🙈")
@@ -603,7 +601,7 @@ async def on_reaction_add(reaction, user):
 @bot.event
 async def on_ready():
     await create_http_session()
-    await log_debug("Bot online – mit robustem Punishment-Zugriff, Modal-Fehler-Handling & Debouncing!")
+    await log_debug("Bot online – finale stabile Version mit Owner-Fix, Infos-Button & Ban-Zugriff!")
 
 
 @bot.event
@@ -616,20 +614,24 @@ async def on_guild_channel_create(channel):
     if isinstance(channel, discord.TextChannel) and channel.category and channel.category.name.lower() in [c.lower() for
                                                                                                            c in
                                                                                                            ACTIVE_TICKET_CATEGORIES]:
-        await asyncio.sleep(5)
-        owner = next((o for o in channel.overwrites if
-                      isinstance(o, discord.Member) and channel.permissions_for(o).view_channel), None)
-        if owner:
-            ticket_owner_cache[channel.id] = owner
-            ticket_history[channel.id] = INITIAL_HISTORY.copy()
-            ticket_closed[channel.id] = False
-            ticket_player_id[channel.id] = ""
-            ticket_player_info_added[channel.id] = False
-            admin_active[channel.id] = False
-            name_modal_sent[channel.id] = False
-            await log_debug(f"Neues Ticket {channel.id} – Owner: {owner}")
-        else:
-            await log_debug(f"Neues Ticket {channel.id} – Kein Owner gefunden")
+        await asyncio.sleep(8)
+        overwrites_members = [target for target in channel.overwrites if
+                              isinstance(target, discord.Member) and not target.bot]
+        if overwrites_members:
+            owner = overwrites_members[0]
+            if channel.permissions_for(owner).view_channel:
+                ticket_owner_cache[channel.id] = owner
+                ticket_history[channel.id] = INITIAL_HISTORY.copy()
+                ticket_closed[channel.id] = False
+                ticket_player_id[channel.id] = ""
+                ticket_player_info_added[channel.id] = False
+                admin_active[channel.id] = False
+                name_modal_sent[channel.id] = False
+                await log_debug(f"Neues Ticket {channel.id} – Owner aus Overwrites: {owner}", channel.id)
+                return
+
+        await log_debug(f"Neues Ticket {channel.id} – Kein Owner aus Overwrites – warte auf erste User-Nachricht",
+                        channel.id)
 
 
 @bot.event
@@ -641,17 +643,23 @@ async def on_message(message):
     if message.channel.category and message.channel.category.name.lower() in [c.lower() for c in
                                                                               ACTIVE_TICKET_CATEGORIES]:
         channel_id = message.channel.id
+
+        if channel_id not in ticket_owner_cache:
+            ticket_owner_cache[channel_id] = message.author
+            ticket_history[channel_id] = INITIAL_HISTORY.copy()
+            await log_debug(f"Ticket {channel_id} – Owner dynamisch aus erster Nachricht: {message.author}", channel_id)
+
         owner = ticket_owner_cache.get(channel_id)
 
         if isinstance(message.author, discord.Member) and has_admin_role(message.author):
             admin_active[channel_id] = True
-            await log_debug(f"Admin {message.author} interveniert – KI pausiert für diese Nachricht", channel_id)
+            await log_debug(f"Admin {message.author} interveniert – KI pausiert", channel_id)
             ticket_history[channel_id].append(
                 {"role": "user", "content": f"[Admin {message.author}]: {message.content}"})
             admin_active[channel_id] = False
             return
 
-        if not owner or message.author != owner:
+        if message.author != owner:
             return
 
         await log_debug(f"Owner-Nachricht in Ticket {channel_id}: {message.content[:100]}", channel_id)

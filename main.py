@@ -104,7 +104,7 @@ async def log_debug(msg: str, channel_id: int = None):
 async def create_http_session():
     global http_session
     connector = aiohttp.TCPConnector(ssl=False)
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(total=90)
     http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
 
@@ -499,10 +499,12 @@ def has_admin_role(member: discord.Member) -> bool:
     return any(role.name == ADMIN_ROLE_NAME for role in member.roles)
 
 
-# === KI-ANTWORT ===
+# === KI-ANTWORT (mit massivem Logging & Fallback) ===
 async def send_ki_response(channel: discord.TextChannel, channel_id: int):
     if ticket_closed[channel_id] or admin_active[channel_id] or not http_session:
         return
+
+    await log_debug("Starte KI-Antwort – History-Länge: " + str(len(ticket_history[channel_id])), channel_id)
 
     messages_for_api = []
     for msg in ticket_history[channel_id]:
@@ -520,68 +522,42 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             "max_tokens": 500,
             "temperature": 0.8
         }
+        await log_debug("Sende Payload an Grok-API", channel_id)
         async with http_session.post("https://api.x.ai/v1/chat/completions", json=payload,
                                      headers=GROK_HEADERS) as response:
+            resp_text = await response.text()
             if response.status != 200:
-                resp_text = await response.text()
-                await log_debug(f"KI-API Fehler: {response.status} – {resp_text}", channel_id)
-                await channel.send("Momentan technische Probleme bei mir – gleich wieder da! 😅")
+                await log_debug(f"KI-API Fehler {response.status}: {resp_text[:500]}", channel_id)
+                await channel.send(
+                    "Hey, momentan hab ich technische Probleme mit meiner KI – ein Admin schaut sich's an. Erzähl trotzdem weiter! 😅")
                 return
             data = await response.json()
+            await log_debug("Grok-API erfolgreich – Antwort erhalten", channel_id)
             bot_reply = data["choices"][0]["message"]["content"].strip()
 
-        user_reply = bot_reply
-        do_temp_unban = False
-        admin_summary = ""
-        request_name_modal = False
+        # Keine Tags mehr – Actions code-basiert
+        await channel.send(bot_reply)
 
-        if "**AUTO_UNBAN:**" in bot_reply:
-            parts = bot_reply.split("**AUTO_UNBAN:**", 1)
-            user_reply = parts[0].strip()
-            do_temp_unban = True
+        # Auto-Temp-Unban: Einfache Keyword-Heuristik (anpassen nach Bedarf)
+        if ticket_player_id[channel_id] and any(word in bot_reply.lower() for word in
+                                                ["temp", "tk", "votekick", "teamkill", "klein", "unban", "clear"]):
+            await api_clear_temp_ban(ticket_player_id[channel_id], channel_id)
+            await channel.send(
+                "Ich hab mal versucht, einen Temp-Ban zu clearen – schau mal, ob du wieder reinkommst! 😏")
 
-        if "**CLOSE TICKET:**" in bot_reply:
-            parts = bot_reply.split("**CLOSE TICKET:**", 1)
-            user_reply = parts[0].strip()
-            ticket_closed[channel_id] = True
-
-        if "**ZUSAMMENFASSUNG FÜR ADMINS:**" in bot_reply:
-            parts = bot_reply.split("**ZUSAMMENFASSUNG FÜR ADMINS:**", 1)
-            user_reply = parts[0].strip()
-            admin_summary = parts[1].strip() if len(parts) > 1 else ""
-
-        if "**REQUEST_NAME_MODAL:**" in bot_reply:
-            parts = bot_reply.split("**REQUEST_NAME_MODAL:**", 1)
-            user_reply = parts[0].strip()
-            if not ticket_player_id[channel_id] and not name_modal_sent[channel_id]:
-                request_name_modal = True
-
-        if user_reply:
-            if request_name_modal:
-                view = NameRequestView(channel_id)
-                await channel.send(user_reply, view=view)
-                name_modal_sent[channel_id] = True
-            else:
-                await channel.send(user_reply)
-
-        if do_temp_unban:
-            player_id = ticket_player_id[channel_id]
-            if player_id:
-                await api_clear_temp_ban(player_id, channel_id)
-
-        if admin_summary:
-            await update_escalation_embed(channel_id, summary=admin_summary)
+        # Eskalation: Wenn KI komplexen Fall andeutet
+        if any(word in bot_reply.lower() for word in ["perma", "blacklist", "cheat", "schwer", "admin"]):
+            await update_escalation_embed(channel_id, summary="Komplexer Fall – Admins prüfen")
 
         ticket_history[channel_id].append({"role": "assistant", "content": bot_reply})
-
-        if ticket_player_id[channel_id] and name_modal_sent[channel_id]:
-            name_modal_sent[channel_id] = False
+        await log_debug("KI-Antwort erfolgreich gesendet", channel_id)
 
     except asyncio.CancelledError:
-        pass
+        await log_debug("KI-Task cancelled (Debounce)", channel_id)
     except Exception as e:
-        await log_debug(f"KI-Exception: {e}", channel_id)
-        await channel.send("Ups, da ist was schiefgelaufen. Versuch’s nochmal oder frag einen Admin! 🙈")
+        await log_debug(f"KI-Exception (kritisch): {str(e)}", channel_id)
+        await channel.send(
+            "Ups, meine KI hat gerade einen Hänger – Versuch's in ein paar Sekunden nochmal oder ping einen Admin! 🙈")
 
 
 # === FEEDBACK NACH CLOSE ===
@@ -612,7 +588,7 @@ async def on_reaction_add(reaction, user):
 @bot.event
 async def on_ready():
     await create_http_session()
-    await log_debug("Bot online – mit super robustem API-Parsing für Ban-Daten!")
+    await log_debug("Bot online – Safety-Fix: Keine Tags mehr, Actions code-basiert!")
 
 
 @bot.event

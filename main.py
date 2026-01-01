@@ -314,8 +314,11 @@ async def search_and_set_best_player_id(channel_id: int, name: str = None) -> bo
                 await log_debug(f"Name-Suche Status {resp.status}", channel_id)
                 return False
             data = await resp.json()
-            players_wrapper = data.get("result", {})
-            players = players_wrapper.get("players", []) if isinstance(players_wrapper, dict) else []
+            result = data.get("result", {})
+            if isinstance(result, dict):
+                players = result.get("players", [])
+            else:
+                players = []
             if not players:
                 await log_debug("Keine Players gefunden", channel_id)
                 ticket_history[channel_id].append({
@@ -355,7 +358,7 @@ async def search_and_set_best_player_id(channel_id: int, name: str = None) -> bo
     return False
 
 
-# === PLAYER-INFO LADEN (robust & detailliert) ===
+# === PLAYER-INFO LADEN (super robustes Parsing) ===
 async def add_player_info_to_history(channel_id: int):
     player_id = ticket_player_id[channel_id]
     if not player_id or ticket_player_info_added[channel_id] or not http_session:
@@ -374,15 +377,26 @@ async def add_player_info_to_history(channel_id: int):
                 })
                 return
             data = await resp.json()
-            punishments = data.get("result", [])
-            if not isinstance(punishments, list):
-                punishments = []
-                await log_debug("Punishments ist keine Liste – unerwartetes API-Format", channel_id)
+            raw_result = data.get("result")
 
+            # Robuster Parsing: Verschiedene mögliche Formate abdecken
+            punishments = []
+            if isinstance(raw_result, list):
+                punishments = raw_result
+            elif isinstance(raw_result, dict):
+                # Mögliche Keys versuchen
+                punishments = raw_result.get("punishments", []) or raw_result.get("history", []) or raw_result.get(
+                    "actions", []) or []
+            # Else fallback empty
+
+            await log_debug(f"Punishments für ID {player_id} geparst – {len(punishments)} Einträge", channel_id)
+
+            # Vollständige JSON-Info für KI (immer, auch wenn leer)
             limited = punishments[:15]
-            full_summary = f"Spieler-Info für ID {player_id} (letzte 15 Einträge): {json.dumps(limited, ensure_ascii=False, default=str)}"
+            full_summary = f"Spieler-Info für ID {player_id} (letzte bis zu 15 Punishment-Einträge, neueste zuerst): {json.dumps(limited, ensure_ascii=False, default=str)}"
             ticket_history[channel_id].append({"role": "system", "content": full_summary})
 
+            # Natürliche Ban-Summary
             ban_entries = [p for p in punishments if
                            p.get("action", "").lower() in ["ban", "temp_ban", "perma_ban", "permanent_ban", "blacklist",
                                                            "remove_temp_ban", "unban", "unblacklist_player"]]
@@ -392,9 +406,9 @@ async def add_player_info_to_history(channel_id: int):
                 reason = latest.get("reason", "kein Grund angegeben")
                 timestamp = latest.get("timestamp", "unbekannt")
                 by = latest.get("by", "unbekannt")
-                ban_summary = f"Aktueller/letzter Ban-Status: {action} wegen '{reason}' am {timestamp} von {by}. Alle Ban-Einträge sind in der vollständigen Info oben."
+                ban_summary = f"Letzter relevanter Punishment: {action} wegen '{reason}' am {timestamp} von {by}. Vollständige Liste oben in der JSON-Info."
             else:
-                ban_summary = "Keine Ban- oder Blacklist-Einträge gefunden – möglicherweise nur Warnings oder keine Punishments."
+                ban_summary = "Keine Ban- oder Blacklist-Einträge in den Daten gefunden – eventuell nur Warnings oder keine Punishments."
 
             ticket_history[channel_id].append({"role": "system", "content": ban_summary})
 
@@ -408,7 +422,7 @@ async def add_player_info_to_history(channel_id: int):
         })
 
 
-# === EMBED AKTUALISIEREN ===
+# === EMBED AKTUALISIEREN (robustes Parsing) ===
 async def update_escalation_embed(channel_id: int, summary: str = None):
     admin_channel = bot.get_channel(ADMIN_SUMMARY_CHANNEL_ID)
     if not admin_channel:
@@ -438,9 +452,12 @@ async def update_escalation_embed(channel_id: int, summary: str = None):
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        punishments = data.get("result", [])
-                        if not isinstance(punishments, list):
-                            punishments = []
+                        raw_result = data.get("result")
+                        punishments = []
+                        if isinstance(raw_result, list):
+                            punishments = raw_result
+                        elif isinstance(raw_result, dict):
+                            punishments = raw_result.get("punishments", []) or raw_result.get("history", []) or []
                         if punishments:
                             pun_str = "\n".join([
                                                     f"{p.get('action', 'Unknown')} ({p.get('reason', 'N/A')}) am {p.get('timestamp', 'N/A')} von {p.get('by', 'N/A')}"
@@ -601,7 +618,7 @@ async def on_reaction_add(reaction, user):
 @bot.event
 async def on_ready():
     await create_http_session()
-    await log_debug("Bot online – finale stabile Version mit Owner-Fix, Infos-Button & Ban-Zugriff!")
+    await log_debug("Bot online – mit super robustem API-Parsing für Ban-Daten!")
 
 
 @bot.event

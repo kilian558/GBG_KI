@@ -540,7 +540,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
 
         # Auto-Temp-Unban: Einfache Keyword-Heuristik (anpassen nach Bedarf)
         if ticket_player_id[channel_id] and any(word in bot_reply.lower() for word in
-                                                ["temp", "tk", "votekick", "teamkill", "klein", "unban", "clear"]):
+                                                ["temp", "tk", "votekick", "teamkill", "klein", "unban", "clear", "missbrauch", "abuse", "vote",]):
             await api_clear_temp_ban(ticket_player_id[channel_id], channel_id)
             await channel.send(
                 "Ich hab mal versucht, einen Temp-Ban zu clearen – schau mal, ob du wieder reinkommst! 😏")

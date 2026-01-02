@@ -97,7 +97,7 @@ PROCESSING_MESSAGES = {
     'en': "Thanks! Processing '{}' now..."
 }
 
-# === EINFACHE SPRACHERKENNUNG (keine externe Lib) ===
+# === EINFACHE SPRACHERKENNUNG ===
 def detect_language(text: str) -> str:
     if not text.strip():
         return 'de'
@@ -209,8 +209,8 @@ class TicketAdminView(View):
             return
         summary = "Letzte 30 Nachrichten:\n\n"
         for msg in ticket.history[-30:]:
-            prefix = "User" if msg["role"] == "user" else "Bot" if msg["role"] == "assistant" else "System"
-            content = msg["content"] if isinstance(msg["content"], str) else "[Bild/Anhang]"
+            prefix = "User" if msg.get("role") == "user" else "Bot" if msg.get("role") == "assistant" else "System"
+            content = msg.get("content", "") if isinstance(msg.get("content"), str) else "[Bild/Anhang]"
             summary += f"{prefix}: {content}\n\n"
         try:
             await interaction.user.send(f"Infos Ticket {self.ticket_channel.mention}:\n{summary}")
@@ -241,7 +241,7 @@ async def search_and_set_best_player_id(channel_id: int, name: str = None) -> bo
             if not players:
                 ticket.history.append({"role": "system", "content": f"Kein Player zu '{name}' gefunden."})
                 return False
-            players_sorted = sorted(players, key=lambda p: max([datetime.fromisoformat(n.get("last_seen", "1970-01-01")).timestamp() for n in p.get("names", [])], default=0), reverse=True)
+            players_sorted = sorted(players, key=lambda p: max([datetime.fromisoformat(n.get("last_seen", "1970-01-01T00:00:00")).timestamp() for n in p.get("names", [])], default=0), reverse=True)
             best_id = players_sorted[0].get("player_id")
             if best_id and best_id != ticket.player_id:
                 ticket.player_id = best_id
@@ -308,11 +308,22 @@ class Ticket:
 
 tickets = {}
 
-# === PROMPT ===
+# === PROMPT LADEN (FIX: Immer Liste machen) ===
 PROMPT_FILE = 'prompts_de.json'
+if not os.path.exists(PROMPT_FILE):
+    raise FileNotFoundError(f"Die Datei '{PROMPT_FILE}' wurde nicht gefunden.")
+
 with open(PROMPT_FILE, 'r', encoding='utf-8') as f:
     prompt_data = json.load(f)
-INITIAL_HISTORY = [{"role": "system", "content": prompt_data}] if isinstance(prompt_data, str) else prompt_data
+
+if isinstance(prompt_data, str):
+    INITIAL_HISTORY = [{"role": "system", "content": prompt_data}]
+elif isinstance(prompt_data, dict):
+    INITIAL_HISTORY = [prompt_data]  # Wrap single dict in list
+elif isinstance(prompt_data, list):
+    INITIAL_HISTORY = prompt_data
+else:
+    raise ValueError("Ungültiges Format in prompts_de.json – muss str, dict oder list sein")
 
 # === LOGGING & SESSION ===
 async def log_debug(msg: str, channel_id: int = None):
@@ -341,8 +352,8 @@ async def reset_admin_active(ticket: Ticket):
     await log_debug("Admin-Timeout abgelaufen", ticket.channel_id)
 
 def trim_history(ticket: Ticket):
-    system = [m for m in ticket.history if m["role"] == "system"]
-    other = [m for m in ticket.history if m["role"] != "system"][-30:]
+    system = [m for m in ticket.history if isinstance(m, dict) and m.get("role") == "system"]
+    other = [m for m in ticket.history if isinstance(m, dict) and m.get("role") != "system"][-30:]
     ticket.history = system + other
 
 async def debounced_ki_response(channel: discord.TextChannel, ticket: Ticket):
@@ -408,10 +419,7 @@ class NameRequestView(View):
         self.channel_id = channel_id
         self.language = language
 
-        button = Button(
-            label=BUTTON_LABELS.get(language, BUTTON_LABELS['de']),
-            style=discord.ButtonStyle.primary
-        )
+        button = Button(label=BUTTON_LABELS.get(language, BUTTON_LABELS['de']), style=discord.ButtonStyle.primary)
         button.callback = self.button_callback
         self.add_item(button)
 
@@ -427,7 +435,11 @@ async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
     if ticket.closed or ticket.admin_active or not http_session:
         return
     trim_history(ticket)
-    payload = {"model": "grok-4", "messages": ticket.history, "max_tokens": 1024, "temperature": 0.8}
+    messages = []
+    for m in ticket.history:
+        if isinstance(m, dict):
+            messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+    payload = {"model": "grok-4", "messages": messages, "max_tokens": 1024, "temperature": 0.8}
     bot_reply = None
     for _ in range(3):
         try:
@@ -436,10 +448,11 @@ async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
                     data = await resp.json()
                     bot_reply = data["choices"][0]["message"]["content"].strip()
                     break
-        except:
+        except Exception as e:
+            await log_debug(f"KI Exception: {e}", ticket.channel_id)
             await asyncio.sleep(5)
     if not bot_reply:
-        await channel.send("KI-Probleme – Admin schaut drauf.")
+        await channel.send("Momentan Probleme mit der KI – ein Admin schaut rein. Erzähl weiter!")
         return
     await channel.send(bot_reply)
     if bot_reply.strip() == "CLOSE TICKET:":
@@ -456,9 +469,9 @@ async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
         return
     if ticket.player_id and any(w in bot_reply.lower() for w in ["temp", "tk", "votekick", "teamkill", "unban", "clear"]):
         await api_clear_temp_ban(ticket.player_id, ticket.channel_id)
-        await channel.send("Temp-Ban clear versucht!")
+        await channel.send("Ich hab versucht, einen Temp-Ban zu clearen!")
     if any(w in bot_reply.lower() for w in ["perma", "blacklist", "cheat", "admin"]):
-        await update_escalation_embed(ticket.channel_id, summary="Komplexer Fall")
+        await update_escalation_embed(ticket.channel_id, summary="Komplexer Fall – Admins prüfen")
     ticket.history.append({"role": "assistant", "content": bot_reply})
 
 async def send_feedback_message(channel: discord.TextChannel):
@@ -472,7 +485,7 @@ async def send_feedback_message(channel: discord.TextChannel):
 @bot.event
 async def on_ready():
     await create_http_session()
-    await log_debug("Bot online – Persistent Views deaktiviert (kein Error mehr)")
+    await log_debug("Bot online – History-Fix implementiert")
 
 @bot.event
 async def on_disconnect():
@@ -483,10 +496,10 @@ async def on_guild_channel_create(channel):
     if isinstance(channel, discord.TextChannel) and channel.category and channel.category.name.lower() in [c.lower() for c in ACTIVE_TICKET_CATEGORIES]:
         await asyncio.sleep(8)
         members = [t for t in channel.overwrites if isinstance(t, discord.Member) and not t.bot]
-        if members and channel.permissions_for(members[0]).view_channel:
+        if members:
             owner = members[0]
             tickets[channel.id] = Ticket(channel.id, owner)
-            await log_debug(f"Neues Ticket {channel.id} – Warte auf erste Nachricht", channel.id)
+            await log_debug(f"Neues Ticket {channel.id} erstellt – Warte auf erste Nachricht", channel.id)
 
 @bot.event
 async def on_message(message):
@@ -498,7 +511,6 @@ async def on_message(message):
         if not ticket:
             ticket = Ticket(cid, message.author)
             tickets[cid] = ticket
-            await log_debug(f"Ticket {cid} erstellt (erste Nachricht)", cid)
 
         if isinstance(message.author, discord.Member) and has_admin_role(message.author):
             ticket.admin_active = True
@@ -506,13 +518,14 @@ async def on_message(message):
                 ticket.admin_timeout_task.cancel()
             ticket.admin_timeout_task = asyncio.create_task(reset_admin_active(ticket))
             ticket.history.append({"role": "user", "content": f"[Admin {message.author}]: {message.content}"})
-            await log_debug(f"Admin aktiv in {cid}", cid)
             return
 
         if message.author != ticket.owner:
             return
 
-        is_first = len([m for m in ticket.history if m["role"] == "user"]) == 0
+        # Sichere Prüfung auf erste User-Nachricht (robust gegen ungültige Einträge)
+        user_messages = [m for m in ticket.history if isinstance(m, dict) and m.get("role") == "user"]
+        is_first = len(user_messages) == 0
 
         content = []
         if message.content:
@@ -520,10 +533,10 @@ async def on_message(message):
         for att in message.attachments:
             if att.content_type and att.content_type.startswith("image/"):
                 content.append({"type": "image_url", "image_url": {"url": att.url}})
-                await log_debug(f"Bild hochgeladen in {cid}", cid)
         if not message.content and content:
             content.insert(0, {"type": "text", "text": "User hat einen Screenshot hochgeladen:"})
-        ticket.history.append({"role": "user", "content": content or message.content})
+
+        ticket.history.append({"role": "user", "content": content if content else message.content})
 
         if is_first:
             ticket.language = detect_language(message.content or "")

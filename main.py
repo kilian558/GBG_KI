@@ -8,8 +8,21 @@ from dotenv import load_dotenv
 import aiohttp
 from datetime import datetime
 from discord.ui import Button, View, Modal, TextInput
+from flask import Flask  # Für Render Web Service Keep-Alive
+import threading
 
 load_dotenv()
+
+# Flask App für Render Web Service
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "GBG KI Bot is alive! 🚀"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -154,7 +167,7 @@ async def api_clear_full_bans(player_id: str, channel_id: int):
     await log_debug(f"Full Ban/Blacklist-Clear für {player_id}: {status}", channel_id)
     return success
 
-# === PLAYER INFO (angepasst an received_actions + blacklists + is_blacklisted) ===
+# === PLAYER INFO ===
 async def search_and_set_best_player_id(channel_id: int, name: str) -> bool:
     ticket = tickets.get(channel_id)
     if not ticket or not name or not http_session:
@@ -203,7 +216,6 @@ async def add_player_info_to_history(channel_id: int):
             blacklists = player_data.get("blacklists", [])
             is_blacklisted = player_data.get("is_blacklisted", False)
 
-            # Letzte Action
             actions_summary = "Keine received_actions gefunden."
             if received_actions:
                 latest = received_actions[0]
@@ -511,7 +523,7 @@ async def on_ready():
     bot.add_view(NameRequestView('de'))
     bot.add_view(NameRequestView('en'))
     bot.add_view(TicketAdminView("", 0))
-    await log_debug("Bot online – received_actions + blacklists fix")
+    await log_debug("Bot online – Web Service Mode aktiv")
 
 @bot.event
 async def on_disconnect():
@@ -577,4 +589,8 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    # Flask in separatem Thread starten (für Render Web Service)
+    threading.Thread(target=run_flask, daemon=True).start()
+    # Discord Bot starten
+    bot.run(DISCORD_TOKEN)

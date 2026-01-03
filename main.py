@@ -8,12 +8,12 @@ from dotenv import load_dotenv
 import aiohttp
 from datetime import datetime
 from discord.ui import Button, View, Modal, TextInput
-from flask import Flask  # Für Render Web Service Keep-Alive
+from flask import Flask
 import threading
 
 load_dotenv()
 
-# Flask App für Render Web Service
+# Flask für Render Web Service
 app = Flask(__name__)
 
 @app.route('/')
@@ -366,12 +366,15 @@ async def log_debug(msg: str, channel_id: int = None):
 http_session = None
 async def create_http_session():
     global http_session
+    if http_session and not http_session.closed:
+        await http_session.close()
     http_session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=aiohttp.ClientTimeout(total=90))
 
 async def close_http_session():
     global http_session
-    if http_session:
+    if http_session and not http_session.closed:
         await http_session.close()
+        http_session = None
 
 async def reset_admin_active(ticket: Ticket):
     await asyncio.sleep(1800)
@@ -442,10 +445,14 @@ class NameRequestView(View):
         if ticket:
             await interaction.response.send_modal(IngameNameOrIdModal(ticket.language))
 
-# === KI RESPONSE ===
+# === KI RESPONSE MIT SESSION RECREATE ===
 async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
     if ticket.closed or ticket.admin_active or not http_session:
         return
+
+    # Session recreate if closed
+    if http_session.closed:
+        await create_http_session()
 
     trim_history(ticket)
 
@@ -462,7 +469,8 @@ async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
                     bot_reply = data["choices"][0]["message"]["content"]
                     break
         except Exception as e:
-            await log_debug(f"KI Exception: {e}", ticket.channel_id)
+            await log_debug(f"KI Exception: {e} – recreate session", ticket.channel_id)
+            await create_http_session()  # Recreate bei Error
             await asyncio.sleep(5)
 
     if not bot_reply:
@@ -495,7 +503,6 @@ async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
 
     if auto_unban and ticket.player_id:
         success = await api_clear_temp_ban(ticket.player_id, ticket.channel_id)
-        # KI handhabt Text
 
     if close_ticket:
         ticket.closed = True
@@ -523,7 +530,7 @@ async def on_ready():
     bot.add_view(NameRequestView('de'))
     bot.add_view(NameRequestView('en'))
     bot.add_view(TicketAdminView("", 0))
-    await log_debug("Bot online – Web Service Mode aktiv")
+    await log_debug("Bot online – Session recreate bei closed")
 
 @bot.event
 async def on_disconnect():
@@ -590,7 +597,5 @@ async def on_message(message):
     await bot.process_commands(message)
 
 if __name__ == "__main__":
-    # Flask in separatem Thread starten (für Render Web Service)
     threading.Thread(target=run_flask, daemon=True).start()
-    # Discord Bot starten
     bot.run(DISCORD_TOKEN)

@@ -179,10 +179,13 @@ async def search_and_set_best_player_id(channel_id: int, name: str) -> bool:
                 params={"player_name": name, "exact_name_match": "False", "ignore_accent": "True", "page_size": 20}
         ) as resp:
             if resp.status != 200:
+                # Keine ID gefunden – KI informieren
+                ticket.history.append({"role": "system", "content": f"Suche nach Name '{name}' fehlgeschlagen – keine passende Player-ID gefunden. Frag nach exakter ID oder Name."})
                 return False
             data = await resp.json()
             players = data.get("result", {}).get("players", []) if isinstance(data.get("result"), dict) else []
             if not players:
+                ticket.history.append({"role": "system", "content": f"Suche nach Name '{name}' fehlgeschlagen – keine Player gefunden. Frag nach exakter ID oder Name."})
                 return False
             players_sorted = sorted(players, key=lambda p: max([datetime.fromisoformat(n.get("last_seen", "1970-01-01")).timestamp() for n in p.get("names", [])], default=0), reverse=True)
             best_id = players_sorted[0].get("player_id")
@@ -193,6 +196,7 @@ async def search_and_set_best_player_id(channel_id: int, name: str) -> bool:
                 return True
     except Exception as e:
         await log_debug(f"Search Exception: {e}", channel_id)
+        ticket.history.append({"role": "system", "content": "Suche fehlgeschlagen – frag nach exakter ID oder Name."})
     return False
 
 async def add_player_info_to_history(channel_id: int):
@@ -207,6 +211,7 @@ async def add_player_info_to_history(channel_id: int):
         ) as resp:
             if resp.status != 200:
                 await log_debug(f"Player-Info Abruf fehlgeschlagen (Status {resp.status})", channel_id)
+                ticket.history.append({"role": "system", "content": "Player-Info Abruf fehlgeschlagen – keine Daten gefunden."})
                 return
             data = await resp.json()
             await log_debug(f"Roh-Player-Info Response: {json.dumps(data, ensure_ascii=False)}", channel_id)
@@ -234,6 +239,7 @@ async def add_player_info_to_history(channel_id: int):
             await log_debug(f"Player-Info geladen – {len(received_actions)} Actions, Blacklisted: {is_blacklisted}", channel_id)
     except Exception as e:
         await log_debug(f"Player-Info Exception: {e}", channel_id)
+        ticket.history.append({"role": "system", "content": "Player-Info Abruf fehlgeschlagen – keine Daten verfügbar."})
 
 # === ADMIN VIEW ===
 class TicketAdminView(View):
@@ -445,7 +451,7 @@ class NameRequestView(View):
         if ticket:
             await interaction.response.send_modal(IngameNameOrIdModal(ticket.language))
 
-# === KI RESPONSE MIT SESSION RECREATE ===
+# === KI RESPONSE ===
 async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
     if ticket.closed or ticket.admin_active or not http_session:
         return
@@ -461,20 +467,29 @@ async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
     payload = {"model": "grok-4", "messages": messages, "max_tokens": 1024, "temperature": 0.8}
 
     bot_reply = None
-    for _ in range(3):
+    backoff = 10
+    for attempt in range(5):
         try:
             async with http_session.post("https://api.x.ai/v1/chat/completions", json=payload, headers=GROK_HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     bot_reply = data["choices"][0]["message"]["content"]
                     break
+                elif resp.status == 429:
+                    await log_debug(f"Rate-Limit – Warte {backoff}s", ticket.channel_id)
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                else:
+                    await log_debug(f"KI-API Status {resp.status}", ticket.channel_id)
+                    await asyncio.sleep(5)
         except Exception as e:
             await log_debug(f"KI Exception: {e} – recreate session", ticket.channel_id)
-            await create_http_session()  # Recreate bei Error
-            await asyncio.sleep(5)
+            await create_http_session()
+            await asyncio.sleep(backoff)
+            backoff *= 2
 
     if not bot_reply:
-        await channel.send("KI-Probleme – weiter schreiben!")
+        await channel.send("Momentan Rate-Limit bei der KI – ich versuch's später nochmal. Erzähl weiter!")
         return
 
     clean_reply = bot_reply
@@ -494,6 +509,7 @@ async def send_ki_response(channel: discord.TextChannel, ticket: Ticket):
     if clean_reply:
         await channel.send(clean_reply)
 
+    # Button nur bei explizitem Tag und wenn nicht schon da
     if request_modal:
         view = NameRequestView(ticket.language)
         if ticket.name_request_message:
@@ -530,7 +546,7 @@ async def on_ready():
     bot.add_view(NameRequestView('de'))
     bot.add_view(NameRequestView('en'))
     bot.add_view(TicketAdminView("", 0))
-    await log_debug("Bot online – Session recreate bei closed")
+    await log_debug("Bot online – Keine doppelte ID-Anfrage, KI sagt bei fehlender ID selbst Bescheid")
 
 @bot.event
 async def on_disconnect():

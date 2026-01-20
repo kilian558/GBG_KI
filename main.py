@@ -9,8 +9,7 @@ from collections import defaultdict
 import requests
 import urllib3
 from datetime import datetime
-from discord.ui import Button, View
-import signal  # Für graceful shutdown
+from discord.ui import Button, View, Modal, TextInput
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -97,18 +96,13 @@ async def log_debug(msg: str, channel_id: int = None):
             pass
 
 
-# === RCON API: BAN/BLACKLIST-CLEAR ===
+# === RCON API: BAN-CLEAR ===
 async def api_clear_ban(player_id: str, channel_id: int):
     if not player_id:
         return False
 
     success = False
-    endpoints = [
-        "remove_temp_ban",
-        "unban",
-        "remove_perma_ban",
-        "unblacklist_player"  # Blacklist-Remove
-    ]
+    endpoints = ["remove_temp_ban", "unban", "remove_perma_ban", "unblacklist_player"]
     for endpoint in endpoints:
         try:
             resp = requests.post(
@@ -130,13 +124,14 @@ async def api_clear_ban(player_id: str, channel_id: int):
     return success
 
 
-# === ADMIN VIEW MIT UNBAN-BUTTON ===
+# === ADMIN VIEW MIT UNBAN + KI-TOGGLE ===
 class TicketAdminView(View):
-    def __init__(self, player_id: str, ticket_channel: discord.TextChannel, channel_id: int):
+    def __init__(self, player_id: str, ticket_channel: discord.TextChannel, channel_id: int, ki_active: bool):
         super().__init__(timeout=None)
         self.player_id = player_id
         self.ticket_channel = ticket_channel
         self.channel_id = channel_id
+        self.ki_active = ki_active
 
     @discord.ui.button(label="Alle Bans/Blacklists entfernen", style=discord.ButtonStyle.green)
     async def clear_ban(self, interaction: discord.Interaction, button: Button):
@@ -148,6 +143,18 @@ class TicketAdminView(View):
         success = await api_clear_ban(self.player_id, self.channel_id)
         status = "erfolgreich" if success else "ohne Effekt"
         await interaction.followup.send(f"Ban/Blacklist-Clear {status}.", ephemeral=True)
+
+    @discord.ui.button(label="KI aktivieren/deaktivieren", style=discord.ButtonStyle.secondary)
+    async def toggle_ki(self, interaction: discord.Interaction, button: Button):
+        if not any(role.name == ADMIN_ROLE_NAME for role in interaction.user.roles):
+            await interaction.response.send_message("Nur HLL Admins dürfen die KI toggeln.", ephemeral=True)
+            return
+
+        admin_active[self.channel_id] = not admin_active[self.channel_id]
+        new_status = "deaktiviert" if admin_active[self.channel_id] else "aktiviert"
+        await interaction.response.send_message(f"KI {new_status} für dieses Ticket.", ephemeral=True)
+        button.label = "KI deaktivieren" if not admin_active[self.channel_id] else "KI aktivieren"
+        await interaction.message.edit(view=self)
 
     @discord.ui.button(label="Ticket-Infos anzeigen", style=discord.ButtonStyle.primary)
     async def show_infos(self, interaction: discord.Interaction, button: Button):
@@ -164,7 +171,37 @@ class TicketAdminView(View):
             await interaction.response.send_message("Konnte DM nicht senden.", ephemeral=True)
 
 
-# === PLAYER-SUCHE (zuletzt aktiv) ===
+# === ID INPUT MODAL ===
+class IDInputModal(Modal, title="Steam-ID oder Ingame-Name eingeben"):
+    input = TextInput(label="ID oder Name", placeholder="z. B. 7656119... oder Ingame-Name",
+                      style=discord.TextStyle.short)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel_id = interaction.channel_id
+        input_text = self.input.value.strip()
+
+        direct_id = extract_player_id(input_text)
+        ingame_name = extract_ingame_name(input_text) or input_text  # Fallback: Ganzen Input als Name
+
+        if direct_id:
+            ticket_player_id[channel_id] = direct_id
+
+        if ingame_name:
+            await search_and_set_best_player_id(channel_id, name=ingame_name)
+
+        await add_player_info_to_history(channel_id)
+
+        if ticket_player_id[channel_id]:
+            await update_escalation_embed(channel_id)
+
+        # KI erneut aufrufen mit neuer Info
+        ticket_history[channel_id].append({"role": "user", "content": f"[ID/Name eingegeben: {input_text}]"})
+        await send_ki_response(interaction.channel, channel_id)
+
+        await interaction.response.send_message("Danke! Ich check das jetzt. 😊", ephemeral=True)
+
+
+# === PLAYER-SUCHE ===
 async def search_and_set_best_player_id(channel_id: int, name: str = None):
     if not name:
         return
@@ -269,7 +306,7 @@ async def update_escalation_embed(channel_id: int, summary: str = None):
     view = None
     if player_id:
         embed.add_field(name="Player-ID", value=player_id, inline=False)
-        view = TicketAdminView(player_id, channel, channel_id)
+        view = TicketAdminView(player_id, channel, channel_id, not admin_active[channel_id])
         try:
             resp = requests.get(
                 f"{API_BASE_URL}/get_players_history",
@@ -343,6 +380,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
         user_reply = bot_reply
         admin_summary = ""
         do_temp_unban = False
+        ask_id = False
 
         if "**AUTO_UNBAN:**" in bot_reply:
             parts = bot_reply.split("**AUTO_UNBAN:**", 1)
@@ -359,13 +397,25 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             user_reply = parts[0].strip()
             admin_summary = parts[1].strip() if len(parts) > 1 else ""
 
+        if "**ASK_ID:**" in bot_reply:
+            parts = bot_reply.split("**ASK_ID:**", 1)
+            user_reply = parts[0].strip()
+            ask_id = True
+
         if user_reply:
-            await channel.send(user_reply)
+            msg = await channel.send(user_reply)
+            if ask_id:
+                modal = IDInputModal()
+                await msg.reply("Klick hier für ID/Name-Eingabe:", view=discord.ui.View().add_item(
+                    discord.ui.Button(label="ID/Name eingeben", style=discord.ButtonStyle.primary,
+                                      custom_id=f"ask_id_{channel_id}")))
+                # Alternative: Direkt Modal – aber Discord erlaubt nur auf Interaction
+                # Besser: Button, der Modal öffnet (braucht persistent View oder Interaction)
 
         if do_temp_unban:
             player_id = ticket_player_id[channel_id]
             if player_id:
-                await api_clear_temp_ban(player_id, channel_id)
+                await api_clear_ban(player_id, channel_id)
 
         if admin_summary:
             await update_escalation_embed(channel_id, summary=admin_summary)
@@ -399,22 +449,9 @@ async def on_reaction_add(reaction, user):
             await log_debug(f"Feedback von {user} in Ticket {channel_id}: {feedback}", channel_id)
 
 
-# === GRACEFUL SHUTDOWN für Render ===
-async def shutdown():
-    await log_debug("Bot shutdown – Graceful exit")
-    await bot.close()
-
-
-def handle_sigterm(*args):
-    asyncio.create_task(shutdown())
-
-
-signal.signal(signal.SIGTERM, handle_sigterm)
-
-
 @bot.event
 async def on_ready():
-    await log_debug("Bot online – bereit für Tickets")
+    await log_debug("Bot online – ID-Modal + KI-Toggle + Temp-only KI")
 
 
 @bot.event

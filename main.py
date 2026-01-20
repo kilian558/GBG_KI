@@ -56,8 +56,7 @@ ticket_player_id = defaultdict(str)
 ticket_player_info_added = defaultdict(bool)
 admin_active = defaultdict(bool)
 ticket_escalation_message = defaultdict(lambda: None)
-ticket_asked_id = defaultdict(bool)
-ticket_id_input_used = defaultdict(bool)  # Flag: Manual Input verwendet
+ticket_asked_id = defaultdict(bool)  # Nur einmal ID-Button senden
 
 # === PROMPT AUS DATEI LADEN ===
 PROMPT_FILE = 'prompts_de.json'
@@ -232,7 +231,7 @@ class IDInputModal(Modal, title="Steam-ID oder Ingame-Name"):
 
         await add_player_info_to_history(self.channel_id)
 
-        ticket_id_input_used[self.channel_id] = True  # Flag setzen
+        ticket_id_input_used[self.channel_id] = True
 
         ticket_history[self.channel_id].append({"role": "user", "content": f"[ID/Name eingegeben: {input_text}]"})
         await send_ki_response(interaction.channel, self.channel_id)
@@ -440,7 +439,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             parts = bot_reply.split("**ASK_ID:**", 1)
             user_reply = parts[0].strip()
             ask_id = True
-            ticket_asked_id[channel_id] = True
+            ticket_asked_id[channel_id] = True  # Nur einmal Button
 
         view = None
         if ask_id:
@@ -455,7 +454,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             view.add_item(button)
 
         if user_reply:
-            await channel.send(user_reply, view=view)
+            await channel.send(user_reply, view=view if ask_id else None)  # View nur beim ersten Mal
 
         if do_temp_unban:
             player_id = ticket_player_id[channel_id]
@@ -496,7 +495,7 @@ async def on_reaction_add(reaction, user):
 
 @bot.event
 async def on_ready():
-    await log_debug("Bot online – finale Version mit ID-Input-Flag")
+    await log_debug("Bot online – ID-Anfrage nur einmal + Button nur einmal")
 
 
 @bot.event
@@ -515,7 +514,6 @@ async def on_guild_channel_create(channel):
             ticket_player_info_added[channel.id] = False
             admin_active[channel.id] = False
             ticket_asked_id[channel.id] = False
-            ticket_id_input_used[channel.id] = False
             await log_debug(f"Neues Ticket {channel.id} – Owner: {owner}")
         else:
             await log_debug(f"Neues Ticket {channel.id} – Kein Owner gefunden")
@@ -552,7 +550,6 @@ async def on_message(message):
             ticket_player_id[channel_id] = direct_id
             id_changed = True
 
-        # Name-Suche NUR, wenn kein manual Input (Modal) verwendet wurde
         if ingame_name and not ticket_id_input_used[channel_id]:
             await search_and_set_best_player_id(channel_id, name=ingame_name)
             if ticket_player_id[channel_id]:

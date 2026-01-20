@@ -56,6 +56,8 @@ ticket_player_id = defaultdict(str)
 ticket_player_info_added = defaultdict(bool)
 admin_active = defaultdict(bool)
 ticket_escalation_message = defaultdict(lambda: None)
+ticket_asked_id = defaultdict(bool)
+ticket_id_input_used = defaultdict(bool)  # Flag: Manual Input verwendet
 
 # === PROMPT AUS DATEI LADEN ===
 PROMPT_FILE = 'prompts_de.json'
@@ -97,6 +99,30 @@ async def log_debug(msg: str, channel_id: int = None):
 
 
 # === RCON API: BAN-CLEAR ===
+async def api_clear_temp_ban(player_id: str, channel_id: int):
+    if not player_id:
+        return False
+
+    success = False
+    try:
+        resp = requests.post(
+            f"{API_BASE_URL}/unban",
+            headers=API_HEADERS,
+            json={"player_id": player_id},
+            verify=False
+        )
+        await log_debug(f"unban – Status {resp.status_code}", channel_id)
+        if resp.status_code == 200:
+            result = resp.json().get("result")
+            if result in (True, None):
+                success = True
+    except Exception as e:
+        await log_debug(f"unban Exception: {e}", channel_id)
+
+    await log_debug(f"Temp-Clear für {player_id}: {'Erfolg' if success else 'ohne Effekt'}", channel_id)
+    return success
+
+
 async def api_clear_ban(player_id: str, channel_id: int):
     if not player_id:
         return False
@@ -111,28 +137,28 @@ async def api_clear_ban(player_id: str, channel_id: int):
                 json={"player_id": player_id},
                 verify=False
             )
-            await log_debug(f"Endpoint {endpoint} – Status {resp.status_code}", channel_id)
+            await log_debug(f"{endpoint} – Status {resp.status_code}", channel_id)
             if resp.status_code == 200:
                 result = resp.json().get("result")
                 if result in (True, None):
                     success = True
                     break
         except Exception as e:
-            await log_debug(f"{endpoint} Fehler: {e}", channel_id)
+            await log_debug(f"{endpoint} Exception: {e}", channel_id)
 
     await log_debug(f"Ban/Blacklist-Clear für {player_id}: {'Erfolg' if success else 'ohne Effekt'}", channel_id)
     return success
 
 
-# === ADMIN VIEW (persistent) ===
+# === ADMIN VIEW ===
 class TicketAdminView(View):
-    def __init__(self, player_id: str, ticket_channel_id: int, channel_id: int):
+    def __init__(self, player_id: str, ticket_channel: discord.TextChannel, channel_id: int):
         super().__init__(timeout=None)
         self.player_id = player_id
-        self.ticket_channel_id = ticket_channel_id
+        self.ticket_channel = ticket_channel
         self.channel_id = channel_id
 
-    @discord.ui.button(label="Alle Bans/Blacklists entfernen", style=discord.ButtonStyle.green, custom_id="clear_ban")
+    @discord.ui.button(label="Alle Bans/Blacklists entfernen", style=discord.ButtonStyle.green)
     async def clear_ban(self, interaction: discord.Interaction, button: Button):
         player_id = self.player_id or ticket_player_id[self.channel_id]
         if not player_id:
@@ -144,14 +170,14 @@ class TicketAdminView(View):
         status = "erfolgreich" if success else "ohne Effekt"
         await interaction.followup.send(f"Ban/Blacklist-Clear {status}.", ephemeral=True)
 
-    @discord.ui.button(label="KI aktivieren", style=discord.ButtonStyle.red, custom_id="toggle_ki")
+    @discord.ui.button(label="KI deaktivieren", style=discord.ButtonStyle.red)
     async def toggle_ki(self, interaction: discord.Interaction, button: Button):
         if not any(role.name == ADMIN_ROLE_NAME for role in interaction.user.roles):
             await interaction.response.send_message("Nur HLL Admins dürfen die KI toggeln.", ephemeral=True)
             return
 
         admin_active[self.channel_id] = not admin_active[self.channel_id]
-        new_label = "KI deaktivieren" if admin_active[self.channel_id] else "KI aktivieren"
+        new_label = "KI aktivieren" if admin_active[self.channel_id] else "KI deaktivieren"
         new_style = discord.ButtonStyle.green if admin_active[self.channel_id] else discord.ButtonStyle.red
         button.label = new_label
         button.style = new_style
@@ -159,7 +185,7 @@ class TicketAdminView(View):
         status = "deaktiviert" if admin_active[self.channel_id] else "aktiviert"
         await interaction.followup.send(f"KI {status} für dieses Ticket.", ephemeral=True)
 
-    @discord.ui.button(label="Ticket-Infos anzeigen", style=discord.ButtonStyle.primary, custom_id="show_infos")
+    @discord.ui.button(label="Ticket-Infos anzeigen", style=discord.ButtonStyle.primary)
     async def show_infos(self, interaction: discord.Interaction, button: Button):
         summary = "Ticket-Konversation (letzte 20):\n\n"
         for msg in ticket_history[self.channel_id][-20:]:
@@ -168,10 +194,11 @@ class TicketAdminView(View):
             prefix = "User" if role == "user" else "Bot"
             summary += f"{prefix}: {content}\n\n"
         try:
-            await interaction.user.send(f"Infos zum Ticket <#{self.ticket_channel_id}>:\n{summary}")
+            await interaction.user.send(f"Infos zum Ticket {self.ticket_channel.mention}:\n{summary}")
             await interaction.response.send_message("Infos per DM gesendet!", ephemeral=True)
-        except:
-            await interaction.response.send_message("Konnte DM nicht senden.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message("Konnte DM nicht senden (Bot geblockt oder DMs deaktiviert).",
+                                                    ephemeral=True)
 
 
 # === ID INPUT MODAL ===
@@ -205,7 +232,8 @@ class IDInputModal(Modal, title="Steam-ID oder Ingame-Name"):
 
         await add_player_info_to_history(self.channel_id)
 
-        # KI erneut aufrufen
+        ticket_id_input_used[self.channel_id] = True  # Flag setzen
+
         ticket_history[self.channel_id].append({"role": "user", "content": f"[ID/Name eingegeben: {input_text}]"})
         await send_ki_response(interaction.channel, self.channel_id)
 
@@ -317,7 +345,7 @@ async def update_escalation_embed(channel_id: int, summary: str = None):
     view = None
     if player_id:
         embed.add_field(name="Player-ID", value=player_id, inline=False)
-        view = TicketAdminView(player_id, channel.id, channel_id)
+        view = TicketAdminView(player_id, channel, channel_id)
         try:
             resp = requests.get(
                 f"{API_BASE_URL}/get_players_history",
@@ -408,10 +436,11 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             user_reply = parts[0].strip()
             admin_summary = parts[1].strip() if len(parts) > 1 else ""
 
-        if "**ASK_ID:**" in bot_reply:
+        if "**ASK_ID:**" in bot_reply and not ticket_asked_id[channel_id]:
             parts = bot_reply.split("**ASK_ID:**", 1)
             user_reply = parts[0].strip()
             ask_id = True
+            ticket_asked_id[channel_id] = True
 
         view = None
         if ask_id:
@@ -431,7 +460,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
         if do_temp_unban:
             player_id = ticket_player_id[channel_id]
             if player_id:
-                await api_clear_ban(player_id, channel_id)
+                await api_clear_temp_ban(player_id, channel_id)
 
         if admin_summary:
             await update_escalation_embed(channel_id, summary=admin_summary)
@@ -440,43 +469,6 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
 
     except Exception as e:
         await log_debug(f"KI-Exception: {e}", channel_id)
-
-
-# === ID INPUT MODAL ===
-class IDInputModal(Modal, title="Steam-ID oder Ingame-Name"):
-    input = TextInput(label="ID oder Name", placeholder="z. B. 7656119... oder Ingame-Name",
-                      style=discord.TextStyle.short)
-
-    def __init__(self, channel_id: int):
-        super().__init__()
-        self.channel_id = channel_id
-
-    async def on_submit(self, interaction: discord.Interaction):
-        input_text = self.input.value.strip()
-
-        direct_id = extract_player_id(input_text)
-        ingame_name = extract_ingame_name(input_text) or input_text
-
-        id_changed = False
-        if direct_id:
-            if direct_id != ticket_player_id[self.channel_id]:
-                ticket_player_id[self.channel_id] = direct_id
-                id_changed = True
-
-        if ingame_name:
-            await search_and_set_best_player_id(self.channel_id, name=ingame_name)
-            if ticket_player_id[self.channel_id]:
-                id_changed = True
-
-        if id_changed:
-            await update_escalation_embed(self.channel_id)
-
-        await add_player_info_to_history(self.channel_id)
-
-        ticket_history[self.channel_id].append({"role": "user", "content": f"[ID/Name eingegeben: {input_text}]"})
-        await send_ki_response(interaction.channel, self.channel_id)
-
-        await interaction.response.send_message("Danke! Ich check das jetzt. 😊", ephemeral=True)
 
 
 # === FEEDBACK NACH CLOSE ===
@@ -504,7 +496,7 @@ async def on_reaction_add(reaction, user):
 
 @bot.event
 async def on_ready():
-    await log_debug("Bot online – ID-Modal fix + KI-Toggle farbig")
+    await log_debug("Bot online – finale Version mit ID-Input-Flag")
 
 
 @bot.event
@@ -522,6 +514,8 @@ async def on_guild_channel_create(channel):
             ticket_player_id[channel.id] = ""
             ticket_player_info_added[channel.id] = False
             admin_active[channel.id] = False
+            ticket_asked_id[channel.id] = False
+            ticket_id_input_used[channel.id] = False
             await log_debug(f"Neues Ticket {channel.id} – Owner: {owner}")
         else:
             await log_debug(f"Neues Ticket {channel.id} – Kein Owner gefunden")
@@ -558,7 +552,8 @@ async def on_message(message):
             ticket_player_id[channel_id] = direct_id
             id_changed = True
 
-        if ingame_name:
+        # Name-Suche NUR, wenn kein manual Input (Modal) verwendet wurde
+        if ingame_name and not ticket_id_input_used[channel_id]:
             await search_and_set_best_player_id(channel_id, name=ingame_name)
             if ticket_player_id[channel_id]:
                 id_changed = True

@@ -219,18 +219,23 @@ class TicketAdminView(View):
 
     @discord.ui.button(label="Ticket-Infos anzeigen", style=discord.ButtonStyle.primary)
     async def show_infos(self, interaction: discord.Interaction, button: Button):
+        # Response MUSS vor DM-Send kommen
+        await interaction.response.defer(ephemeral=True)
+        
         summary = "Ticket-Konversation (letzte 20):\n\n"
         for msg in ticket_history[self.channel_id][-20:]:
             role = msg["role"]
             content = msg["content"]
             prefix = "User" if role == "user" else "Bot"
             summary += f"{prefix}: {content}\n\n"
+        
         try:
             await interaction.user.send(f"Infos zum Ticket {self.ticket_channel.mention}:\n{summary}")
-            await interaction.response.send_message("Infos per DM gesendet!", ephemeral=True)
+            await interaction.followup.send("✅ Infos per DM gesendet!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Konnte DM nicht senden (Bot geblockt oder DMs deaktiviert).", ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message("Konnte DM nicht senden (Bot geblockt oder DMs deaktiviert).",
-                                                    ephemeral=True)
+            await interaction.followup.send(f"❌ Fehler: {str(e)}", ephemeral=True)
 
 
 # === ID INPUT MODAL ===
@@ -243,6 +248,9 @@ class IDInputModal(Modal, title="Steam-ID oder Ingame-Name"):
         self.channel_id = channel_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        # Response SOFORT senden (verhindert "Etwas ist schiefgelaufen")
+        await interaction.response.send_message("🔍 Danke! Ich checke das jetzt...", ephemeral=True)
+        
         input_text = self.input.value.strip()
 
         direct_id = extract_player_id(input_text)
@@ -254,7 +262,7 @@ class IDInputModal(Modal, title="Steam-ID oder Ingame-Name"):
                 ticket_player_id[self.channel_id] = direct_id
                 id_changed = True
 
-        if ingame_name:
+        if ingame_name and not direct_id:
             await search_and_set_best_player_id(self.channel_id, name=ingame_name)
             if ticket_player_id[self.channel_id]:
                 id_changed = True
@@ -262,14 +270,23 @@ class IDInputModal(Modal, title="Steam-ID oder Ingame-Name"):
         if id_changed:
             await update_escalation_embed(self.channel_id)
 
+        # Ban-Grund automatisch abrufen und zur Historie hinzufügen
         await add_player_info_to_history(self.channel_id)
+        await add_ban_reason_to_history(self.channel_id)
 
         ticket_id_input_used[self.channel_id] = True
 
         ticket_history[self.channel_id].append({"role": "user", "content": f"[ID/Name eingegeben: {input_text}]"})
+        
+        # Button aus ursprünglicher Nachricht entfernen
+        try:
+            if interaction.message:
+                await interaction.message.edit(view=None)
+        except:
+            pass
+        
+        # KI-Response mit Ban-Grund-Info
         await send_ki_response(interaction.channel, self.channel_id)
-
-        await interaction.response.send_message("Danke! Ich check das jetzt. 😊", ephemeral=True)
 
 
 # === PLAYER-SUCHE ===
@@ -362,11 +379,77 @@ async def add_player_info_to_history(channel_id: int):
                     
                     ticket_history[channel_id].append({"role": "system", "content": summary})
                     ticket_player_info_added[channel_id] = True
-                    await log_debug("Player-Info zur KI-History hinzugefügt", channel_id)
+                    await log_debug("✅ Player-Info zur KI-History hinzugefügt", channel_id)
     except asyncio.TimeoutError:
         await log_debug(f"Player-Info Timeout nach {HTTP_TIMEOUT}s", channel_id)
     except Exception as e:
         await log_debug(f"Player-Info Abruf Exception: {e}", channel_id)
+
+
+async def add_ban_reason_to_history(channel_id: int):
+    """Ruft den letzten Ban-Grund ab und fügt ihn strukturiert zur KI-Historie hinzu"""
+    player_id = ticket_player_id[channel_id]
+    if not player_id:
+        return
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{API_BASE_URL}/get_players_history",
+                headers=API_HEADERS,
+                params={"player_id": player_id, "page_size": 50},
+                ssl=False
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    punishments = data.get("result", [])
+                    
+                    if isinstance(punishments, list) and punishments:
+                        # Finde den letzten Ban (nicht Kick/Warning)
+                        ban_actions = ["ban", "perma", "temp_ban", "blacklist"]
+                        last_ban = None
+                        
+                        for punishment in punishments:
+                            action = punishment.get("action", "").lower()
+                            if any(ban_type in action for ban_type in ban_actions):
+                                last_ban = punishment
+                                break
+                        
+                        if last_ban:
+                            action = last_ban.get("action", "Ban")
+                            reason = last_ban.get("reason", "Kein Grund angegeben")
+                            timestamp = last_ban.get("timestamp", "Unbekannt")
+                            admin = last_ban.get("by", "System")
+                            
+                            ban_info = (
+                                f"LETZTER BAN-GRUND gefunden:\n"
+                                f"- Aktion: {action}\n"
+                                f"- Grund: {reason}\n"
+                                f"- Zeitpunkt: {timestamp}\n"
+                                f"- Von: {admin}\n\n"
+                                f"Teile dem User den Grund mit und entscheide basierend darauf, ob AUTO_UNBAN oder Eskalation."
+                            )
+                            
+                            ticket_history[channel_id].append({"role": "system", "content": ban_info})
+                            await log_debug(f"✅ Ban-Grund zur Historie hinzugefügt: {action} - {reason}", channel_id)
+                        else:
+                            # Kein Ban gefunden, nur Warnings/Kicks
+                            ticket_history[channel_id].append({
+                                "role": "system", 
+                                "content": "Kein aktiver Ban gefunden in der Historie. Nur Kicks/Warnings vorhanden."
+                            })
+                            await log_debug("⚠️ Kein Ban in Historie gefunden", channel_id)
+                    else:
+                        ticket_history[channel_id].append({
+                            "role": "system",
+                            "content": "Keine Punishment-Historie für diesen Spieler verfügbar."
+                        })
+                        await log_debug("⚠️ Keine Punishment-Daten gefunden", channel_id)
+    except asyncio.TimeoutError:
+        await log_debug(f"Ban-Grund Abruf Timeout nach {HTTP_TIMEOUT}s", channel_id)
+    except Exception as e:
+        await log_debug(f"Ban-Grund Abruf Exception: {e}", channel_id)
 
 
 # === EMBED AKTUALISIEREN ===

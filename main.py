@@ -4,9 +4,12 @@ import asyncio
 import os
 import re
 import json
+import signal
+import sys
+from typing import Optional
 from dotenv import load_dotenv
 from collections import defaultdict
-import requests
+import aiohttp
 import urllib3
 from datetime import datetime
 from discord.ui import Button, View, Modal, TextInput
@@ -48,6 +51,12 @@ ADMIN_SUMMARY_CHANNEL_ID = 1455199315713851686
 DEBUG_CHANNEL_ID = 1455236964981670121
 ADMIN_ROLE_NAME = "HLL Admin"
 
+# Performance & Limits
+HTTP_TIMEOUT = 30  # Sekunden für API-Calls
+MAX_HISTORY_LENGTH = 50  # Maximale Konversations-Historie pro Ticket
+MAX_RETRIES = 3  # Retry-Versuche für API-Calls
+RETRY_DELAY = 2  # Sekunden zwischen Retries
+
 # Ticket-States
 ticket_owner_cache = {}
 ticket_history = defaultdict(list)
@@ -57,6 +66,7 @@ ticket_player_info_added = defaultdict(bool)
 admin_active = defaultdict(bool)
 ticket_escalation_message = defaultdict(lambda: None)
 ticket_asked_id = defaultdict(bool)  # Nur einmal ID-Button senden
+ticket_id_input_used = defaultdict(bool)  # Verhindert mehrfache ID-Abfragen
 
 # === PROMPT AUS DATEI LADEN ===
 PROMPT_FILE = 'prompts_de.json'
@@ -87,34 +97,40 @@ except Exception as e:
 
 # === LOGGING ===
 async def log_debug(msg: str, channel_id: int = None):
-    full_msg = f"[Ticket {channel_id or 'Global'}] {msg}"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    full_msg = f"[{timestamp}] [Ticket {channel_id or 'Global'}] {msg}"
     print(full_msg)
     channel = bot.get_channel(DEBUG_CHANNEL_ID)
     if channel:
         try:
             await channel.send(f"[DEBUG] {full_msg}")
-        except:
-            pass
+        except Exception as e:
+            print(f"[{timestamp}] Fehler beim Senden der Debug-Nachricht: {e}")
 
 
 # === RCON API: BAN-CLEAR ===
-async def api_clear_temp_ban(player_id: str, channel_id: int):
+async def api_clear_temp_ban(player_id: str, channel_id: int) -> bool:
     if not player_id:
         return False
 
     success = False
     try:
-        resp = requests.post(
-            f"{API_BASE_URL}/unban",
-            headers=API_HEADERS,
-            json={"player_id": player_id},
-            verify=False
-        )
-        await log_debug(f"unban – Status {resp.status_code}", channel_id)
-        if resp.status_code == 200:
-            result = resp.json().get("result")
-            if result in (True, None):
-                success = True
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                f"{API_BASE_URL}/unban",
+                headers=API_HEADERS,
+                json={"player_id": player_id},
+                ssl=False
+            ) as resp:
+                await log_debug(f"unban – Status {resp.status}", channel_id)
+                if resp.status == 200:
+                    data = await resp.json()
+                    result = data.get("result")
+                    if result in (True, None):
+                        success = True
+    except asyncio.TimeoutError:
+        await log_debug(f"unban Timeout nach {HTTP_TIMEOUT}s", channel_id)
     except Exception as e:
         await log_debug(f"unban Exception: {e}", channel_id)
 
@@ -122,28 +138,45 @@ async def api_clear_temp_ban(player_id: str, channel_id: int):
     return success
 
 
-async def api_clear_ban(player_id: str, channel_id: int):
+async def api_clear_ban(player_id: str, channel_id: int) -> bool:
     if not player_id:
         return False
 
     success = False
     endpoints = ["remove_temp_ban", "unban", "remove_perma_ban", "unblacklist_player"]
-    for endpoint in endpoints:
-        try:
-            resp = requests.post(
-                f"{API_BASE_URL}/{endpoint}",
-                headers=API_HEADERS,
-                json={"player_id": player_id},
-                verify=False
-            )
-            await log_debug(f"{endpoint} – Status {resp.status_code}", channel_id)
-            if resp.status_code == 200:
-                result = resp.json().get("result")
-                if result in (True, None):
-                    success = True
+    
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for endpoint in endpoints:
+            for attempt in range(MAX_RETRIES):
+                try:
+                    async with session.post(
+                        f"{API_BASE_URL}/{endpoint}",
+                        headers=API_HEADERS,
+                        json={"player_id": player_id},
+                        ssl=False
+                    ) as resp:
+                        await log_debug(f"{endpoint} – Status {resp.status} (Versuch {attempt + 1})", channel_id)
+                        if resp.status == 200:
+                            data = await resp.json()
+                            result = data.get("result")
+                            if result in (True, None):
+                                success = True
+                                break
+                        elif resp.status >= 500 and attempt < MAX_RETRIES - 1:
+                            await asyncio.sleep(RETRY_DELAY)
+                            continue
+                        break
+                except asyncio.TimeoutError:
+                    await log_debug(f"{endpoint} Timeout (Versuch {attempt + 1})", channel_id)
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RETRY_DELAY)
+                except Exception as e:
+                    await log_debug(f"{endpoint} Exception: {e}", channel_id)
                     break
-        except Exception as e:
-            await log_debug(f"{endpoint} Exception: {e}", channel_id)
+            
+            if success:
+                break
 
     await log_debug(f"Ban/Blacklist-Clear für {player_id}: {'Erfolg' if success else 'ohne Effekt'}", channel_id)
     return success
@@ -240,31 +273,34 @@ class IDInputModal(Modal, title="Steam-ID oder Ingame-Name"):
 
 
 # === PLAYER-SUCHE ===
-async def search_and_set_best_player_id(channel_id: int, name: str = None):
+async def search_and_set_best_player_id(channel_id: int, name: Optional[str] = None):
     if not name:
         return
 
     try:
-        resp = requests.get(
-            f"{API_BASE_URL}/get_players_history",
-            headers=API_HEADERS,
-            params={
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            params = {
                 "player_name": name,
                 "exact_name_match": "False",
                 "ignore_accent": "True",
                 "page_size": 20
-            },
-            verify=False
-        )
-        if resp.status_code != 200:
-            await log_debug(f"Name-Suche Status {resp.status_code}", channel_id)
-            return
+            }
+            async with session.get(
+                f"{API_BASE_URL}/get_players_history",
+                headers=API_HEADERS,
+                params=params,
+                ssl=False
+            ) as resp:
+                if resp.status != 200:
+                    await log_debug(f"Name-Suche Status {resp.status}", channel_id)
+                    return
 
-        data = resp.json()
-        players = data.get("result", {}).get("players", [])
-        if not isinstance(players, list) or not players:
-            await log_debug("Keine Players gefunden", channel_id)
-            return
+                data = await resp.json()
+                players = data.get("result", {}).get("players", [])
+                if not isinstance(players, list) or not players:
+                    await log_debug("Keine Players gefunden", channel_id)
+                    return
 
         def get_max_last_seen(player):
             names = player.get("names", [])
@@ -300,23 +336,35 @@ async def add_player_info_to_history(channel_id: int):
         return
 
     try:
-        resp = requests.get(
-            f"{API_BASE_URL}/get_players_history",
-            headers=API_HEADERS,
-            params={"player_id": player_id, "page_size": 20},
-            verify=False
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            info = data.get("result", [])
-            if isinstance(info, list) and info:
-                limited = info[:10]
-                summary = f"Spieler-Info (ID {player_id}): Letzte Aktivitäten/Punishments: {json.dumps(limited, ensure_ascii=False, default=str)}"
-            else:
-                summary = f"Spieler-Info (ID {player_id}): Keine Daten verfügbar."
-            ticket_history[channel_id].append({"role": "system", "content": summary})
-            ticket_player_info_added[channel_id] = True
-            await log_debug("Player-Info zur KI-History hinzugefügt", channel_id)
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"{API_BASE_URL}/get_players_history",
+                headers=API_HEADERS,
+                params={"player_id": player_id, "page_size": 20},
+                ssl=False
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    info = data.get("result", [])
+                    if isinstance(info, list) and info:
+                        limited = info[:10]
+                        summary = f"Spieler-Info (ID {player_id}): Letzte Aktivitäten/Punishments: {json.dumps(limited, ensure_ascii=False, default=str)}"
+                    else:
+                        summary = f"Spieler-Info (ID {player_id}): Keine Daten verfügbar."
+                    
+                    # Verhindere Memory-Leak: Limitiere Historie-Länge
+                    if len(ticket_history[channel_id]) >= MAX_HISTORY_LENGTH:
+                        # Behalte System-Prompt + letzte Nachrichten
+                        system_msgs = [m for m in ticket_history[channel_id] if m.get("role") == "system"][:1]
+                        recent_msgs = [m for m in ticket_history[channel_id] if m.get("role") != "system"][-(MAX_HISTORY_LENGTH-5):]
+                        ticket_history[channel_id] = system_msgs + recent_msgs
+                    
+                    ticket_history[channel_id].append({"role": "system", "content": summary})
+                    ticket_player_info_added[channel_id] = True
+                    await log_debug("Player-Info zur KI-History hinzugefügt", channel_id)
+    except asyncio.TimeoutError:
+        await log_debug(f"Player-Info Timeout nach {HTTP_TIMEOUT}s", channel_id)
     except Exception as e:
         await log_debug(f"Player-Info Abruf Exception: {e}", channel_id)
 
@@ -346,37 +394,53 @@ async def update_escalation_embed(channel_id: int, summary: str = None):
         embed.add_field(name="Player-ID", value=player_id, inline=False)
         view = TicketAdminView(player_id, channel, channel_id)
         try:
-            resp = requests.get(
-                f"{API_BASE_URL}/get_players_history",
-                headers=API_HEADERS,
-                params={"player_id": player_id, "page_size": 10},
-                verify=False
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                punishments = data.get("result", []) or []
-                if isinstance(punishments, list) and punishments:
-                    pun_str = "\n".join(
-                        [f"{p.get('action', 'Unknown')} am {p.get('timestamp', 'N/A')}" for p in punishments[:5]])
-                    embed.add_field(name="Letzte Punishments", value=pun_str or "Keine", inline=False)
+            timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{API_BASE_URL}/get_players_history",
+                    headers=API_HEADERS,
+                    params={"player_id": player_id, "page_size": 10},
+                    ssl=False
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        punishments = data.get("result", []) or []
+                        if isinstance(punishments, list) and punishments:
+                            pun_str = "\n".join(
+                                [f"{p.get('action', 'Unknown')} am {p.get('timestamp', 'N/A')}" for p in punishments[:5]])
+                            embed.add_field(name="Letzte Punishments", value=pun_str or "Keine", inline=False)
+        except asyncio.TimeoutError:
+            await log_debug(f"Eskalation Player-Info Timeout", channel_id)
         except Exception as e:
             await log_debug(f"Eskalation Player-Info Fehler: {e}", channel_id)
 
     msg = ticket_escalation_message[channel_id]
-    if msg:
-        await msg.edit(embed=embed, view=view)
-    else:
-        msg = await admin_channel.send(embed=embed, view=view)
-        ticket_escalation_message[channel_id] = msg
+    try:
+        if msg:
+            try:
+                await msg.edit(embed=embed, view=view)
+            except discord.NotFound:
+                # Message wurde gelöscht, erstelle neue
+                msg = await admin_channel.send(embed=embed, view=view)
+                ticket_escalation_message[channel_id] = msg
+            except discord.HTTPException as e:
+                await log_debug(f"Discord API Fehler beim Embed-Update: {e}", channel_id)
+        else:
+            msg = await admin_channel.send(embed=embed, view=view)
+            ticket_escalation_message[channel_id] = msg
+    except discord.Forbidden:
+        await log_debug(f"Keine Berechtigung für Admin-Channel {ADMIN_SUMMARY_CHANNEL_ID}", channel_id)
+    except Exception as e:
+        await log_debug(f"Fehler beim Senden/Editieren des Eskalations-Embeds: {e}", channel_id)
 
 
 # === ID & NAME ERKENNEN ===
-def extract_player_id(text: str) -> str | None:
+def extract_player_id(text: str):
     match = re.search(r'(7656119\d{10}|[a-f0-9]{32})', text)
     return match.group(0) if match else None
 
 
-def extract_ingame_name(text: str) -> str | None:
+def extract_ingame_name(text: str):
     patterns = [
         r'(?:name|ingame|bin|heiße|mein name|spiele als|als |ich bin|Name ist|der Name|Name:)[\s:]*([^\n\r<@!&]+)',
         r'([℧\w\.\-\_|\[\](){} ]{4,30})'
@@ -399,7 +463,13 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
     if ticket_closed[channel_id] or admin_active[channel_id]:
         return
 
+    # Memory-Leak Prevention: Limitiere Historie
     history = ticket_history[channel_id]
+    if len(history) > MAX_HISTORY_LENGTH:
+        system_msgs = [m for m in history if m.get("role") == "system"][:1]
+        recent_msgs = [m for m in history if m.get("role") != "system"][-(MAX_HISTORY_LENGTH-2):]
+        history = system_msgs + recent_msgs
+        ticket_history[channel_id] = history
 
     try:
         payload = {
@@ -408,12 +478,21 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             "max_tokens": 200,
             "temperature": 0.8
         }
-        response = requests.post("https://api.x.ai/v1/chat/completions", json=payload, headers=GROK_HEADERS, timeout=30)
-        if response.status_code != 200:
-            await log_debug(f"KI-API Fehler: {response.status_code}", channel_id)
-            return
+        
+        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://api.x.ai/v1/chat/completions",
+                json=payload,
+                headers=GROK_HEADERS
+            ) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    await log_debug(f"KI-API Fehler: {response.status} - {error_text[:200]}", channel_id)
+                    return
 
-        bot_reply = response.json()["choices"][0]["message"]["content"].strip()
+                data = await response.json()
+                bot_reply = data["choices"][0]["message"]["content"].strip()
 
         user_reply = bot_reply
         admin_summary = ""
@@ -454,7 +533,18 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             view.add_item(button)
 
         if user_reply:
-            await channel.send(user_reply, view=view if ask_id else None)  # View nur beim ersten Mal
+            try:
+                await channel.send(user_reply, view=view if ask_id else None)
+            except discord.HTTPException as e:
+                if e.status == 429:  # Rate limit
+                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+                    await log_debug(f"Rate-Limit erreicht, warte {retry_after}s", channel_id)
+                    await asyncio.sleep(retry_after)
+                    await channel.send(user_reply, view=view if ask_id else None)
+                else:
+                    await log_debug(f"Discord API Fehler beim Senden: {e}", channel_id)
+            except Exception as e:
+                await log_debug(f"Fehler beim Senden der KI-Antwort: {e}", channel_id)
 
         if do_temp_unban:
             player_id = ticket_player_id[channel_id]
@@ -466,6 +556,14 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
 
         ticket_history[channel_id].append({"role": "assistant", "content": bot_reply})
 
+    except asyncio.TimeoutError:
+        await log_debug(f"KI-API Timeout nach {HTTP_TIMEOUT}s", channel_id)
+        try:
+            await channel.send("⚠️ Die KI braucht gerade etwas länger. Bitte hab einen Moment Geduld.")
+        except:
+            pass
+    except KeyError as e:
+        await log_debug(f"KI-API Response-Format Fehler: {e}", channel_id)
     except Exception as e:
         await log_debug(f"KI-Exception: {e}", channel_id)
 
@@ -514,6 +612,8 @@ async def on_guild_channel_create(channel):
             ticket_player_info_added[channel.id] = False
             admin_active[channel.id] = False
             ticket_asked_id[channel.id] = False
+            ticket_id_input_used[channel.id] = False
+            ticket_escalation_message[channel.id] = None
             await log_debug(f"Neues Ticket {channel.id} – Owner: {owner}")
         else:
             await log_debug(f"Neues Ticket {channel.id} – Kein Owner gefunden")
@@ -569,4 +669,41 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+# === GRACEFUL SHUTDOWN FÜR PM2 ===
+async def shutdown():
+    """Sauberes Herunterfahren des Bots"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp}] Bot wird heruntergefahren...")
+    await log_debug("Bot-Shutdown initiiert")
+    await bot.close()
+    print(f"[{timestamp}] Bot erfolgreich beendet.")
+
+def shutdown_handler(signum, frame):
+    """Signal-Handler für SIGINT/SIGTERM"""
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{timestamp}] Shutdown-Signal empfangen (Signal {signum})")
+    
+    # Erstelle Task für async shutdown
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        loop.create_task(shutdown())
+    else:
+        loop.run_until_complete(shutdown())
+
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
+
+
+# === BOT STARTEN MIT ERROR HANDLING ===
+if __name__ == "__main__":
+    try:
+        token = os.getenv("DISCORD_TOKEN")
+        if not token:
+            raise ValueError("DISCORD_TOKEN fehlt in .env!")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bot wird gestartet...")
+        bot.run(token)
+    except KeyboardInterrupt:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bot durch Benutzer gestoppt.")
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Kritischer Fehler beim Bot-Start: {e}")
+        sys.exit(1)

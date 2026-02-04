@@ -263,6 +263,17 @@ class VIPModal(Modal, title="VIP-Zeit vergeben"):
         success, new_exp = await add_vip_to_player(self.player_id, hours, self.channel_id)
         
         if success:
+            # Nachricht an KI/User im Ticket-Channel
+            channel = bot.get_channel(self.channel_id)
+            if channel:
+                if hours == 0:
+                    vip_msg = f"🌟 **VIP vergeben!** Der Admin hat dir Lifetime VIP zugewiesen. Dein VIP läuft nie ab!"
+                else:
+                    vip_msg = f"🌟 **VIP vergeben!** Der Admin hat dir VIP für {hours} Stunden zugewiesen. Dein VIP ist gültig bis: {new_exp}"
+                
+                await channel.send(vip_msg)
+            
+            # Bestätigung für Admin
             if hours == 0:
                 await interaction.followup.send(
                     f"✅ Lifetime VIP für Player {self.player_id} vergeben!\nGültig bis: {new_exp}",

@@ -606,7 +606,7 @@ async def add_player_info_to_history(channel_id: int):
 
 
 async def add_ban_reason_to_history(channel_id: int):
-    """Ruft den letzten Ban-Grund ab und fügt ihn strukturiert zur KI-Historie hinzu"""
+    """Ruft den letzten Ban-Grund ab und fügt ihn strukturiert zur KI-Historie hinzu - durchsucht alle 3 Server"""
     player_id = ticket_player_id[channel_id]
     if not player_id:
         return
@@ -616,110 +616,110 @@ async def add_ban_reason_to_history(channel_id: int):
     try:
         timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # 1. get_ban - Aktuelle Bans
-            try:
-                async with session.get(
-                    f"{API_BASE_URL}/get_ban",
-                    headers=API_HEADERS,
-                    params={"player_id": player_id},
-                    ssl=False
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        result = data.get("result")
-                        if result and isinstance(result, list):
-                            for ban in result:
-                                ban_type = ban.get("type", "Unknown")
-                                reason = ban.get("reason", "Kein Grund")
-                                timestamp = ban.get("timestamp", "Unbekannt")
-                                ban_info_parts.append(f"AKTIVER BAN ({ban_type}): {reason} (seit {timestamp})")
-                            await log_debug(f"✅ get_ban: {len(result)} aktive Bans gefunden", channel_id)
-                        else:
-                            await log_debug("ℹ️ get_ban: Keine aktiven Bans", channel_id)
-            except Exception as e:
-                await log_debug(f"❌ get_ban Fehler: {e}", channel_id)
-
-            # 2. get_blacklist_records - Blacklist
-            try:
-                async with session.get(
-                    f"{API_BASE_URL}/get_blacklist_records",
-                    headers=API_HEADERS,
-                    params={"player_id": player_id, "page_size": 10},
-                    ssl=False
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        result = data.get("result")
-                        if result and isinstance(result, list) and result:
-                            for record in result[:3]:  # Max 3 Einträge
-                                reason = record.get("reason", "Kein Grund")
-                                timestamp = record.get("timestamp", "Unbekannt")
-                                ban_info_parts.append(f"BLACKLIST: {reason} (am {timestamp})")
-                            await log_debug(f"✅ get_blacklist_records: {len(result)} Einträge", channel_id)
-                        else:
-                            await log_debug("ℹ️ get_blacklist_records: Keine Blacklist-Einträge", channel_id)
-            except Exception as e:
-                await log_debug(f"❌ get_blacklist_records Fehler: {e}", channel_id)
-
-            # 3. get_historical_logs - Punishment-Historie
-            try:
-                async with session.get(
-                    f"{API_BASE_URL}/get_historical_logs",
-                    headers=API_HEADERS,
-                    params={"player_name": "", "player_id": player_id, "limit": 50},
-                    ssl=False
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        logs = data.get("result", [])
-                        if isinstance(logs, list) and logs:
-                            # Finde letzte Ban-Aktionen
-                            ban_actions = ["BAN", "TEMPBAN", "PERMABAN", "BLACKLIST"]
-                            last_bans = []
-                            for log in logs:
-                                action = log.get("action", "").upper()
-                                if any(ban_type in action for ban_type in ban_actions):
-                                    last_bans.append(log)
-                                    if len(last_bans) >= 3:
-                                        break
-                            
-                            for ban_log in last_bans:
-                                action = ban_log.get("action", "Ban")
-                                reason = ban_log.get("message", "Kein Grund")
-                                timestamp = ban_log.get("creation_time", "Unbekannt")
-                                ban_info_parts.append(f"HISTORIE ({action}): {reason} (am {timestamp})")
-                            
-                            await log_debug(f"✅ get_historical_logs: {len(last_bans)} Ban-Logs gefunden", channel_id)
-                        else:
-                            await log_debug("ℹ️ get_historical_logs: Keine Ban-Logs", channel_id)
-            except Exception as e:
-                await log_debug(f"❌ get_historical_logs Fehler: {e}", channel_id)
-
-            # 4. Fallback: get_players_history (alte Methode)
-            if not ban_info_parts:
+            # Alle 3 Server durchsuchen
+            for server_idx, server_url in enumerate(API_SERVERS, 1):
+                server_bans = []
+                
+                # 1. get_ban - Aktuelle Bans
                 try:
                     async with session.get(
-                        f"{API_BASE_URL}/get_players_history",
+                        f"{server_url}/get_ban",
                         headers=API_HEADERS,
-                        params={"player_id": player_id, "page_size": 50},
+                        params={"player_id": player_id},
                         ssl=False
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            punishments = data.get("result", [])
-                            
-                            if isinstance(punishments, list) and punishments:
-                                ban_actions = ["ban", "perma", "temp_ban", "blacklist"]
-                                for punishment in punishments:
-                                    action = punishment.get("action", "").lower()
-                                    if any(ban_type in action for ban_type in ban_actions):
-                                        reason = punishment.get("reason", "Kein Grund")
-                                        timestamp = punishment.get("timestamp", "Unbekannt")
-                                        ban_info_parts.append(f"PLAYER HISTORY ({action}): {reason} (am {timestamp})")
-                                        break
-                                await log_debug("✅ get_players_history: Fallback erfolgreich", channel_id)
+                            result = data.get("result")
+                            if result and isinstance(result, list):
+                                for ban in result:
+                                    ban_type = ban.get("type", "Unknown")
+                                    reason = ban.get("reason", "Kein Grund")
+                                    timestamp = ban.get("timestamp", "Unbekannt")
+                                    server_bans.append(f"AKTIVER BAN [Server {server_idx}] ({ban_type}): {reason} (seit {timestamp})")
+                                await log_debug(f"✅ Server {server_idx} get_ban: {len(result)} aktive Bans", channel_id)
                 except Exception as e:
-                    await log_debug(f"❌ get_players_history Fehler: {e}", channel_id)
+                    await log_debug(f"❌ Server {server_idx} get_ban Fehler: {e}", channel_id)
+
+                # 2. get_blacklist_records - Blacklist
+                try:
+                    async with session.get(
+                        f"{server_url}/get_blacklist_records",
+                        headers=API_HEADERS,
+                        params={"player_id": player_id, "page_size": 10},
+                        ssl=False
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            result = data.get("result")
+                            if result and isinstance(result, list) and result:
+                                for record in result[:2]:  # Max 2 pro Server
+                                    reason = record.get("reason", "Kein Grund")
+                                    timestamp = record.get("timestamp", "Unbekannt")
+                                    server_bans.append(f"BLACKLIST [Server {server_idx}]: {reason} (am {timestamp})")
+                                await log_debug(f"✅ Server {server_idx} blacklist: {len(result)} Einträge", channel_id)
+                except Exception as e:
+                    await log_debug(f"❌ Server {server_idx} blacklist Fehler: {e}", channel_id)
+
+                # 3. get_historical_logs - Punishment-Historie
+                try:
+                    async with session.get(
+                        f"{server_url}/get_historical_logs",
+                        headers=API_HEADERS,
+                        params={"player_name": "", "player_id": player_id, "limit": 50},
+                        ssl=False
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            logs = data.get("result", [])
+                            if isinstance(logs, list) and logs:
+                                ban_actions = ["BAN", "TEMPBAN", "PERMABAN", "BLACKLIST"]
+                                last_bans = []
+                                for log in logs:
+                                    action = log.get("action", "").upper()
+                                    if any(ban_type in action for ban_type in ban_actions):
+                                        last_bans.append(log)
+                                        if len(last_bans) >= 2:  # Max 2 pro Server
+                                            break
+                                
+                                for ban_log in last_bans:
+                                    action = ban_log.get("action", "Ban")
+                                    reason = ban_log.get("message", "Kein Grund")
+                                    timestamp = ban_log.get("creation_time", "Unbekannt")
+                                    server_bans.append(f"HISTORIE [Server {server_idx}] ({action}): {reason} (am {timestamp})")
+                                
+                                if last_bans:
+                                    await log_debug(f"✅ Server {server_idx} history: {len(last_bans)} Ban-Logs", channel_id)
+                except Exception as e:
+                    await log_debug(f"❌ Server {server_idx} history Fehler: {e}", channel_id)
+
+                # 4. Fallback: get_players_history
+                if not server_bans:
+                    try:
+                        async with session.get(
+                            f"{server_url}/get_players_history",
+                            headers=API_HEADERS,
+                            params={"player_id": player_id, "page_size": 50},
+                            ssl=False
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                punishments = data.get("result", [])
+                                
+                                if isinstance(punishments, list) and punishments:
+                                    ban_actions = ["ban", "perma", "temp_ban", "blacklist"]
+                                    for punishment in punishments:
+                                        action = punishment.get("action", "").lower()
+                                        if any(ban_type in action for ban_type in ban_actions):
+                                            reason = punishment.get("reason", "Kein Grund")
+                                            timestamp = punishment.get("timestamp", "Unbekannt")
+                                            server_bans.append(f"PLAYER HISTORY [Server {server_idx}] ({action}): {reason} (am {timestamp})")
+                                            break
+                    except Exception as e:
+                        await log_debug(f"❌ Server {server_idx} player_history Fehler: {e}", channel_id)
+                
+                # Füge Server-Bans zu Gesamt-Liste hinzu
+                ban_info_parts.extend(server_bans)
 
         # Ban-Info zur Historie hinzufügen
         if ban_info_parts:

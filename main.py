@@ -29,9 +29,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # === KONFIG ===
 # Alle Server-URLs
 API_SERVERS = [
-    os.getenv('API_BASE_URL_1', 'https://gbg-hll.com:64302/api').rstrip('/'),
-    os.getenv('API_BASE_URL_2', 'https://gbg-hll.com:64202/api').rstrip('/'),
-    os.getenv('API_BASE_URL_3', 'https://gbg-hll.com:64402/api').rstrip('/')
+    os.getenv('API_BASE_URL_1', 'https://gbg-hll.com:64301/api').rstrip('/'),
+    os.getenv('API_BASE_URL_2', 'https://gbg-hll.com:64302/api').rstrip('/'),
+    os.getenv('API_BASE_URL_3', 'https://gbg-hll.com:64303/api').rstrip('/')
 ]
 API_BASE_URL = API_SERVERS[0]  # Hauptserver für nicht-VIP Operationen
 API_KEY = os.getenv('API_KEY', '').strip()

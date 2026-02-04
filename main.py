@@ -67,6 +67,7 @@ RETRY_DELAY = 2  # Sekunden zwischen Retries
 ticket_owner_cache = {}
 ticket_history = defaultdict(list)
 ticket_closed = defaultdict(bool)
+ticket_feedback_sent = defaultdict(bool)  # Feedback nur einmal senden
 ticket_player_id = defaultdict(str)
 ticket_player_info_added = defaultdict(bool)
 admin_active = defaultdict(bool)
@@ -567,6 +568,7 @@ async def search_and_set_best_player_id(channel_id: int, name: Optional[str] = N
 
 
 async def add_player_info_to_history(channel_id: int):
+    """Fügt Spieler-Info zur KI-Historie hinzu + zeigt sie im Ticket an"""
     player_id = ticket_player_id[channel_id]
     if not player_id or ticket_player_info_added[channel_id]:
         return
@@ -582,10 +584,28 @@ async def add_player_info_to_history(channel_id: int):
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    info = data.get("result", [])
-                    if isinstance(info, list) and info:
-                        limited = info[:10]
-                        summary = f"Spieler-Info (ID {player_id}): Letzte Aktivitäten/Punishments: {json.dumps(limited, ensure_ascii=False, default=str)}"
+                    player_data = data.get("result", [])
+                    
+                    if isinstance(player_data, list) and player_data:
+                        player = player_data[0]
+                        player_name = player.get("name", "Unbekannt")
+                        sessions = player.get("sessions_count", 0)
+                        playtime = player.get("total_playtime_seconds", 0)
+                        playtime_hours = round(playtime / 3600, 1)
+                        
+                        # Für KI
+                        limited = player_data[:10]
+                        summary = f"Spieler-Info (ID {player_id}, Name: {player_name}): Sessions: {sessions}, Spielzeit: {playtime_hours}h. Letzte Aktivitäten: {json.dumps(limited, ensure_ascii=False, default=str)}"
+                        
+                        # Im Ticket anzeigen
+                        channel = bot.get_channel(channel_id)
+                        if channel:
+                            info_embed = discord.Embed(
+                                title="📄 Spieler-Informationen gefunden",
+                                description=f"**Name:** {player_name}\n**Steam-ID:** `{player_id}`\n**Sessions:** {sessions}\n**Spielzeit:** {playtime_hours}h",
+                                color=discord.Color.blue()
+                            )
+                            await channel.send(embed=info_embed)
                     else:
                         summary = f"Spieler-Info (ID {player_id}): Keine Daten verfügbar."
                     
@@ -1003,6 +1023,7 @@ async def on_guild_channel_create(channel):
             ticket_owner_cache[channel.id] = owner
             ticket_history[channel.id] = INITIAL_HISTORY.copy()
             ticket_closed[channel.id] = False
+            ticket_feedback_sent[channel.id] = False
             ticket_player_id[channel.id] = ""
             ticket_player_info_added[channel.id] = False
             admin_active[channel.id] = False
@@ -1071,8 +1092,9 @@ async def on_message(message):
         ticket_history[channel_id].append({"role": "user", "content": message.content})
         await send_ki_response(message.channel, channel_id)
 
-        if ticket_closed[channel_id]:
+        if ticket_closed[channel_id] and not ticket_feedback_sent[channel_id]:
             await send_feedback_message(message.channel)
+            ticket_feedback_sent[channel_id] = True
 
     await bot.process_commands(message)
 

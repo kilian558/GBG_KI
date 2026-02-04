@@ -27,7 +27,13 @@ intents.reactions = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # === KONFIG ===
-API_BASE_URL = os.getenv('API_BASE_URL', 'https://gbg-hll.com:64302/api/').rstrip('/')
+# Alle Server-URLs
+API_SERVERS = [
+    os.getenv('API_BASE_URL_1', 'https://gbg-hll.com:64302/api').rstrip('/'),
+    os.getenv('API_BASE_URL_2', 'https://gbg-hll.com:64202/api').rstrip('/'),
+    os.getenv('API_BASE_URL_3', 'https://gbg-hll.com:64402/api').rstrip('/')
+]
+API_BASE_URL = API_SERVERS[0]  # Hauptserver für nicht-VIP Operationen
 API_KEY = os.getenv('API_KEY', '').strip()
 GROK_API_KEY = os.getenv('GROK_API_KEY', '').strip()
 
@@ -263,25 +269,46 @@ class VIPModal(Modal, title="VIP-Zeit vergeben"):
         success, new_exp = await add_vip_to_player(self.player_id, hours, self.channel_id)
         
         if success:
+            # Zeitformat schön formatieren
+            if hours == 0:
+                formatted_date = "niemals"
+                time_text = "Lifetime VIP"
+            else:
+                # Parse Datum
+                try:
+                    exp_dt = datetime.fromisoformat(new_exp.replace('Z', '+00:00'))
+                    formatted_date = exp_dt.strftime("%d.%m.%Y um %H:%M Uhr")
+                except:
+                    formatted_date = new_exp
+                
+                # Stunden in Tage umrechnen (runden)
+                days = round(hours / 24)
+                if days == 0:
+                    time_text = f"{hours} Stunden"
+                elif days == 1:
+                    time_text = "1 Tag"
+                else:
+                    time_text = f"{days} Tage"
+            
             # Nachricht an KI/User im Ticket-Channel
             channel = bot.get_channel(self.channel_id)
             if channel:
                 if hours == 0:
-                    vip_msg = f"🌟 **VIP vergeben!** Der Admin hat dir Lifetime VIP zugewiesen. Dein VIP läuft nie ab!"
+                    vip_msg = f"🌟 **VIP vergeben!** Der Admin hat dir Lifetime VIP auf allen Servern zugewiesen. Dein VIP läuft nie ab!"
                 else:
-                    vip_msg = f"🌟 **VIP vergeben!** Der Admin hat dir VIP für {hours} Stunden zugewiesen. Dein VIP ist gültig bis: {new_exp}"
+                    vip_msg = f"🌟 **VIP vergeben!** Der Admin hat dir VIP für {time_text} auf allen Servern zugewiesen. Dein VIP ist gültig bis: {formatted_date}"
                 
                 await channel.send(vip_msg)
             
             # Bestätigung für Admin
             if hours == 0:
                 await interaction.followup.send(
-                    f"✅ Lifetime VIP für Player {self.player_id} vergeben!\nGültig bis: {new_exp}",
+                    f"✅ Lifetime VIP für Player {self.player_id} auf allen 3 Servern vergeben!",
                     ephemeral=True
                 )
             else:
                 await interaction.followup.send(
-                    f"✅ VIP für Player {self.player_id} vergeben!\n+{hours} Stunden\nNeue Ablaufzeit: {new_exp}",
+                    f"✅ VIP für Player {self.player_id} auf allen 3 Servern vergeben!\n+{time_text} ({hours}h)\nGültig bis: {formatted_date}",
                     ephemeral=True
                 )
         else:
@@ -318,7 +345,7 @@ async def get_vip_expiration(player_id: str, channel_id: int) -> Optional[str]:
 
 
 async def add_vip_to_player(player_id: str, hours: int, channel_id: int) -> tuple[bool, str]:
-    """Vergibt VIP an einen Spieler. hours=0 für Lifetime, sonst +hours auf aktuelle Zeit"""
+    """Vergibt VIP an einen Spieler auf allen 3 Servern. hours=0 für Lifetime, sonst +hours auf aktuelle Zeit"""
     
     # Aktuelle VIP-Zeit abrufen
     current_exp = await get_vip_expiration(player_id, channel_id)
@@ -331,18 +358,6 @@ async def add_vip_to_player(player_id: str, hours: int, channel_id: int) -> tupl
     try:
         timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Entferne altes VIP (falls vorhanden)
-            try:
-                async with session.post(
-                    f"{API_BASE_URL}/remove_vip",
-                    headers=API_HEADERS,
-                    json={"player_id": player_id},
-                    ssl=False
-                ) as resp:
-                    await log_debug(f"🗑️ VIP entfernt: {resp.status}", channel_id)
-            except Exception as e:
-                await log_debug(f"⚠️ VIP-Remove Fehler (okay wenn kein VIP): {e}", channel_id)
-            
             # Berechne neue Ablaufzeit
             if hours == 0:
                 # Lifetime VIP bis 3000-01-01
@@ -371,26 +386,49 @@ async def add_vip_to_player(player_id: str, hours: int, channel_id: int) -> tupl
             
             await log_debug(f"➕ Neue VIP-Zeit berechnet: {new_exp}", channel_id)
             
-            # VIP hinzufügen
+            # VIP hinzufügen auf ALLEN 3 Servern
             payload = {
                 "player_id": player_id,
                 "expiration": new_exp,
                 "description": f"Admin Ticket-Support: +{hours}h" if hours > 0 else "Lifetime VIP (Ticket-Support)"
             }
             
-            async with session.post(
-                f"{API_BASE_URL}/add_vip",
-                headers=API_HEADERS,
-                json=payload,
-                ssl=False
-            ) as resp:
-                if resp.status == 200:
-                    await log_debug(f"✅ VIP erfolgreich vergeben: {new_exp}", channel_id)
-                    return True, new_exp
-                else:
-                    error_text = await resp.text()
-                    await log_debug(f"❌ add_vip Fehler {resp.status}: {error_text[:200]}", channel_id)
-                    return False, ""
+            success_count = 0
+            for idx, server_url in enumerate(API_SERVERS, 1):
+                try:
+                    # Entferne altes VIP (falls vorhanden)
+                    try:
+                        async with session.post(
+                            f"{server_url}/remove_vip",
+                            headers=API_HEADERS,
+                            json={"player_id": player_id},
+                            ssl=False
+                        ) as resp:
+                            await log_debug(f"🗑️ Server {idx}: VIP entfernt ({resp.status})", channel_id)
+                    except Exception as e:
+                        await log_debug(f"⚠️ Server {idx}: VIP-Remove Fehler (okay): {e}", channel_id)
+                    
+                    # Neues VIP hinzufügen
+                    async with session.post(
+                        f"{server_url}/add_vip",
+                        headers=API_HEADERS,
+                        json=payload,
+                        ssl=False
+                    ) as resp:
+                        if resp.status == 200:
+                            await log_debug(f"✅ Server {idx}: VIP erfolgreich vergeben", channel_id)
+                            success_count += 1
+                        else:
+                            error_text = await resp.text()
+                            await log_debug(f"❌ Server {idx}: add_vip Fehler {resp.status}: {error_text[:200]}", channel_id)
+                except Exception as e:
+                    await log_debug(f"❌ Server {idx}: Exception: {e}", channel_id)
+            
+            if success_count > 0:
+                await log_debug(f"✅ VIP auf {success_count}/3 Servern vergeben", channel_id)
+                return True, new_exp
+            else:
+                return False, ""
     
     except Exception as e:
         await log_debug(f"❌ add_vip_to_player Exception: {e}", channel_id)

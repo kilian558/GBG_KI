@@ -301,7 +301,7 @@ async def search_and_set_best_player_id(channel_id: int, name: Optional[str] = N
                 "player_name": name,
                 "exact_name_match": "False",
                 "ignore_accent": "True",
-                "page_size": 20
+                "page_size": 50  # Mehr Ergebnisse für besseres Matching
             }
             async with session.get(
                 f"{API_BASE_URL}/get_players_history",
@@ -310,41 +310,63 @@ async def search_and_set_best_player_id(channel_id: int, name: Optional[str] = N
                 ssl=False
             ) as resp:
                 if resp.status != 200:
-                    await log_debug(f"Name-Suche Status {resp.status}", channel_id)
+                    await log_debug(f"❌ Name-Suche Status {resp.status}", channel_id)
                     return
 
                 data = await resp.json()
                 players = data.get("result", {}).get("players", [])
                 if not isinstance(players, list) or not players:
-                    await log_debug("Keine Players gefunden", channel_id)
+                    await log_debug(f"❌ Keine Players für '{name}' gefunden", channel_id)
                     return
+                
+                await log_debug(f"🔍 {len(players)} Players gefunden für '{name}'", channel_id)
 
-        def get_max_last_seen(player):
-            names = player.get("names", [])
-            timestamps = []
-            for n in names:
-                ts_str = n.get("last_seen")
-                if ts_str:
-                    try:
-                        timestamps.append(datetime.fromisoformat(ts_str).timestamp())
-                    except:
-                        pass
-            return max(timestamps) if timestamps else 0
+                # Prüfe auf exakte Übereinstimmung (100%)
+                exact_match = None
+                for player in players:
+                    player_names = player.get("names", [])
+                    for name_entry in player_names:
+                        player_name = name_entry.get("name", "")
+                        if player_name.lower() == name.lower():
+                            exact_match = player
+                            await log_debug(f"✅ Exakte Übereinstimmung gefunden: {player_name}", channel_id)
+                            break
+                    if exact_match:
+                        break
+                
+                # Falls exakte Übereinstimmung, nimm diese
+                if exact_match:
+                    best = exact_match
+                else:
+                    # Sonst: Sortiere nach neuester Aktivität
+                    def get_max_last_seen(player):
+                        names = player.get("names", [])
+                        timestamps = []
+                        for n in names:
+                            ts_str = n.get("last_seen")
+                            if ts_str:
+                                try:
+                                    timestamps.append(datetime.fromisoformat(ts_str).timestamp())
+                                except:
+                                    pass
+                        return max(timestamps) if timestamps else 0
 
-        players_sorted = sorted(players, key=get_max_last_seen, reverse=True)
+                    players_sorted = sorted(players, key=get_max_last_seen, reverse=True)
+                    best = players_sorted[0] if players_sorted else None
+                    await log_debug(f"🕒 Keine exakte Übereinstimmung, nehme neuesten: {best.get('names', [{}])[0].get('name', 'Unknown') if best else 'None'}", channel_id)
 
-        if players_sorted:
-            best = players_sorted[0]
-            best_id = best.get("player_id")
-            if best_id:
-                old_id = ticket_player_id[channel_id]
-                if best_id != old_id:
-                    ticket_player_id[channel_id] = best_id
-                    await log_debug(f"Neue beste ID {best_id} (von Name '{name}') – vorher {old_id}", channel_id)
-                    await update_escalation_embed(channel_id)
+                if best:
+                    best_id = best.get("player_id")
+                    if best_id:
+                        old_id = ticket_player_id[channel_id]
+                        if best_id != old_id:
+                            ticket_player_id[channel_id] = best_id
+                            best_name = best.get("names", [{}])[0].get("name", "Unknown")
+                            await log_debug(f"✅ Neue ID gesetzt: {best_id} (Name: {best_name}) - vorher {old_id}", channel_id)
+                            await update_escalation_embed(channel_id)
 
     except Exception as e:
-        await log_debug(f"Player-Suche Exception: {e}", channel_id)
+        await log_debug(f"❌ Player-Suche Exception: {e}", channel_id)
 
 
 async def add_player_info_to_history(channel_id: int):
@@ -541,6 +563,25 @@ def has_admin_role(member: discord.Member) -> bool:
     return any(role.name == ADMIN_ROLE_NAME for role in member.roles)
 
 
+def is_report_about_other_player(message: str) -> bool:
+    """Erkennt ob es sich um einen Report über einen ANDEREN Spieler handelt"""
+    report_keywords = [
+        "report", "cheater", "cheat", "hacker", "hack", "aimbot", 
+        "wallhack", "esp", "verdacht", "verdächtig", "suspicious",
+        "der spieler", "ein spieler", "jemand", "player", 
+        "eben noch", "gerade", "war auf", "ist auf",
+        "sollte", "wohlmöglich", "eventuell", "vielleicht"
+    ]
+    
+    message_lower = message.lower()
+    
+    # Wenn Report-Keywords + nicht über sich selbst ("ich", "mein", "bin")
+    has_report_keyword = any(keyword in message_lower for keyword in report_keywords)
+    is_about_self = any(word in message_lower for word in ["ich bin", "bin ich", "wurde ich", "mein ban", "meine id", "ich wurde"])
+    
+    return has_report_keyword and not is_about_self
+
+
 # === KI-ANTWORT ===
 async def send_ki_response(channel: discord.TextChannel, channel_id: int):
     if ticket_closed[channel_id] or admin_active[channel_id]:
@@ -723,8 +764,21 @@ async def on_message(message):
         if not owner or message.author != owner:
             return
 
-        await log_debug(f"Owner-Nachricht in Ticket {channel_id}: {message.content[:100]}", channel_id)
+        await log_debug(f"💬 Owner-Nachricht in Ticket {channel_id}: {message.content[:100]}", channel_id)
 
+        # Prüfe ob es ein Report über anderen Spieler ist
+        is_report = is_report_about_other_player(message.content)
+        if is_report:
+            await log_debug(f"🚨 Report über anderen Spieler erkannt - keine ID-Suche", channel_id)
+            ticket_history[channel_id].append({
+                "role": "system", 
+                "content": "[WICHTIG] User reportet einen ANDEREN Spieler (kein eigenes Ban-Problem). KEINE ID-Abfrage, direkt eskalieren!"
+            })
+            ticket_history[channel_id].append({"role": "user", "content": message.content})
+            await send_ki_response(message.channel, channel_id)
+            return
+
+        # Normale Ban-Problem-Behandlung
         direct_id = extract_player_id(message.content)
         ingame_name = extract_ingame_name(message.content)
 

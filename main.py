@@ -414,64 +414,135 @@ async def add_ban_reason_to_history(channel_id: int):
     if not player_id:
         return
 
+    ban_info_parts = []
+    
     try:
         timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                f"{API_BASE_URL}/get_players_history",
-                headers=API_HEADERS,
-                params={"player_id": player_id, "page_size": 50},
-                ssl=False
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    punishments = data.get("result", [])
-                    
-                    if isinstance(punishments, list) and punishments:
-                        # Finde den letzten Ban (nicht Kick/Warning)
-                        ban_actions = ["ban", "perma", "temp_ban", "blacklist"]
-                        last_ban = None
-                        
-                        for punishment in punishments:
-                            action = punishment.get("action", "").lower()
-                            if any(ban_type in action for ban_type in ban_actions):
-                                last_ban = punishment
-                                break
-                        
-                        if last_ban:
-                            action = last_ban.get("action", "Ban")
-                            reason = last_ban.get("reason", "Kein Grund angegeben")
-                            timestamp = last_ban.get("timestamp", "Unbekannt")
-                            admin = last_ban.get("by", "System")
-                            
-                            ban_info = (
-                                f"LETZTER BAN-GRUND gefunden:\n"
-                                f"- Aktion: {action}\n"
-                                f"- Grund: {reason}\n"
-                                f"- Zeitpunkt: {timestamp}\n"
-                                f"- Von: {admin}\n\n"
-                                f"Teile dem User den Grund mit und entscheide basierend darauf, ob AUTO_UNBAN oder Eskalation."
-                            )
-                            
-                            ticket_history[channel_id].append({"role": "system", "content": ban_info})
-                            await log_debug(f"✅ Ban-Grund zur Historie hinzugefügt: {action} - {reason}", channel_id)
+            # 1. get_ban - Aktuelle Bans
+            try:
+                async with session.get(
+                    f"{API_BASE_URL}/get_ban",
+                    headers=API_HEADERS,
+                    params={"player_id": player_id},
+                    ssl=False
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        result = data.get("result")
+                        if result and isinstance(result, list):
+                            for ban in result:
+                                ban_type = ban.get("type", "Unknown")
+                                reason = ban.get("reason", "Kein Grund")
+                                timestamp = ban.get("timestamp", "Unbekannt")
+                                ban_info_parts.append(f"AKTIVER BAN ({ban_type}): {reason} (seit {timestamp})")
+                            await log_debug(f"✅ get_ban: {len(result)} aktive Bans gefunden", channel_id)
                         else:
-                            # Kein Ban gefunden, nur Warnings/Kicks
-                            ticket_history[channel_id].append({
-                                "role": "system", 
-                                "content": "Kein aktiver Ban gefunden in der Historie. Nur Kicks/Warnings vorhanden."
-                            })
-                            await log_debug("⚠️ Kein Ban in Historie gefunden", channel_id)
-                    else:
-                        ticket_history[channel_id].append({
-                            "role": "system",
-                            "content": "Keine Punishment-Historie für diesen Spieler verfügbar."
-                        })
-                        await log_debug("⚠️ Keine Punishment-Daten gefunden", channel_id)
-    except asyncio.TimeoutError:
-        await log_debug(f"Ban-Grund Abruf Timeout nach {HTTP_TIMEOUT}s", channel_id)
+                            await log_debug("ℹ️ get_ban: Keine aktiven Bans", channel_id)
+            except Exception as e:
+                await log_debug(f"❌ get_ban Fehler: {e}", channel_id)
+
+            # 2. get_blacklist_records - Blacklist
+            try:
+                async with session.get(
+                    f"{API_BASE_URL}/get_blacklist_records",
+                    headers=API_HEADERS,
+                    params={"player_id": player_id, "page_size": 10},
+                    ssl=False
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        result = data.get("result")
+                        if result and isinstance(result, list) and result:
+                            for record in result[:3]:  # Max 3 Einträge
+                                reason = record.get("reason", "Kein Grund")
+                                timestamp = record.get("timestamp", "Unbekannt")
+                                ban_info_parts.append(f"BLACKLIST: {reason} (am {timestamp})")
+                            await log_debug(f"✅ get_blacklist_records: {len(result)} Einträge", channel_id)
+                        else:
+                            await log_debug("ℹ️ get_blacklist_records: Keine Blacklist-Einträge", channel_id)
+            except Exception as e:
+                await log_debug(f"❌ get_blacklist_records Fehler: {e}", channel_id)
+
+            # 3. get_historical_logs - Punishment-Historie
+            try:
+                async with session.get(
+                    f"{API_BASE_URL}/get_historical_logs",
+                    headers=API_HEADERS,
+                    params={"player_name": "", "player_id": player_id, "limit": 50},
+                    ssl=False
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        logs = data.get("result", [])
+                        if isinstance(logs, list) and logs:
+                            # Finde letzte Ban-Aktionen
+                            ban_actions = ["BAN", "TEMPBAN", "PERMABAN", "BLACKLIST"]
+                            last_bans = []
+                            for log in logs:
+                                action = log.get("action", "").upper()
+                                if any(ban_type in action for ban_type in ban_actions):
+                                    last_bans.append(log)
+                                    if len(last_bans) >= 3:
+                                        break
+                            
+                            for ban_log in last_bans:
+                                action = ban_log.get("action", "Ban")
+                                reason = ban_log.get("message", "Kein Grund")
+                                timestamp = ban_log.get("creation_time", "Unbekannt")
+                                ban_info_parts.append(f"HISTORIE ({action}): {reason} (am {timestamp})")
+                            
+                            await log_debug(f"✅ get_historical_logs: {len(last_bans)} Ban-Logs gefunden", channel_id)
+                        else:
+                            await log_debug("ℹ️ get_historical_logs: Keine Ban-Logs", channel_id)
+            except Exception as e:
+                await log_debug(f"❌ get_historical_logs Fehler: {e}", channel_id)
+
+            # 4. Fallback: get_players_history (alte Methode)
+            if not ban_info_parts:
+                try:
+                    async with session.get(
+                        f"{API_BASE_URL}/get_players_history",
+                        headers=API_HEADERS,
+                        params={"player_id": player_id, "page_size": 50},
+                        ssl=False
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            punishments = data.get("result", [])
+                            
+                            if isinstance(punishments, list) and punishments:
+                                ban_actions = ["ban", "perma", "temp_ban", "blacklist"]
+                                for punishment in punishments:
+                                    action = punishment.get("action", "").lower()
+                                    if any(ban_type in action for ban_type in ban_actions):
+                                        reason = punishment.get("reason", "Kein Grund")
+                                        timestamp = punishment.get("timestamp", "Unbekannt")
+                                        ban_info_parts.append(f"PLAYER HISTORY ({action}): {reason} (am {timestamp})")
+                                        break
+                                await log_debug("✅ get_players_history: Fallback erfolgreich", channel_id)
+                except Exception as e:
+                    await log_debug(f"❌ get_players_history Fehler: {e}", channel_id)
+
+        # Ban-Info zur Historie hinzufügen
+        if ban_info_parts:
+            ban_summary = "\n".join(ban_info_parts)
+            ban_message = (
+                f"LETZTER BAN-GRUND gefunden:\n"
+                f"{ban_summary}\n\n"
+                f"Teile dem User den Grund mit und entscheide basierend darauf, ob AUTO_UNBAN oder Eskalation."
+            )
+            ticket_history[channel_id].append({"role": "system", "content": ban_message})
+            await log_debug(f"✅ Ban-Info zur Historie hinzugefügt: {len(ban_info_parts)} Einträge", channel_id)
+        else:
+            ticket_history[channel_id].append({
+                "role": "system",
+                "content": "Keine Ban-/Blacklist-Informationen für diesen Spieler gefunden. Evtl. nur Votekick oder temporär."
+            })
+            await log_debug("⚠️ Keine Ban-Infos in allen Endpoints gefunden", channel_id)
+            
     except Exception as e:
-        await log_debug(f"Ban-Grund Abruf Exception: {e}", channel_id)
+        await log_debug(f"❌ Ban-Grund Abruf genereller Fehler: {e}", channel_id)
 
 
 # === EMBED AKTUALISIEREN ===
@@ -637,6 +708,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             parts = bot_reply.split("**ZUSAMMENFASSUNG FÜR ADMINS:**", 1)
             user_reply = parts[0].strip()
             admin_summary = parts[1].strip() if len(parts) > 1 else ""
+            await log_debug(f"📢 Admin-Zusammenfassung erstellt (wird nicht an User gesendet)", channel_id)
 
         if "**ASK_ID:**" in bot_reply and not ticket_asked_id[channel_id]:
             parts = bot_reply.split("**ASK_ID:**", 1)

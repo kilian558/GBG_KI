@@ -20,6 +20,7 @@ module.exports = {
     min_uptime: '10s',
     max_restarts: 10,
     restart_delay: 4000,
+    cron_restart: '30 4 * * *',
     kill_timeout: 5000,
     listen_timeout: 3000,
     shutdown_with_message: true

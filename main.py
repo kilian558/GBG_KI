@@ -63,6 +63,18 @@ MAX_HISTORY_LENGTH = 50  # Maximale Konversations-Historie pro Ticket
 MAX_RETRIES = 3  # Retry-Versuche für API-Calls
 RETRY_DELAY = 2  # Sekunden zwischen Retries
 
+# KI-API Tuning (env overridable)
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4-1-fast-reasoning").strip()
+GROK_MAX_TOKENS = int(os.getenv("GROK_MAX_TOKENS", "200"))
+GROK_TEMPERATURE = float(os.getenv("GROK_TEMPERATURE", "0.8"))
+GROK_TIMEOUT = int(os.getenv("GROK_TIMEOUT", "45"))
+GROK_MAX_RETRIES = int(os.getenv("GROK_MAX_RETRIES", "2"))
+GROK_RETRY_DELAY = int(os.getenv("GROK_RETRY_DELAY", "2"))
+GROK_FALLBACK_MESSAGE = os.getenv(
+    "GROK_FALLBACK_MESSAGE",
+    "Hinweis: Die KI ist gerade ueberlastet. Ich habe dein Ticket registriert und antworte so schnell wie moeglich."
+)
+
 # Ticket-States
 ticket_owner_cache = {}
 ticket_history = defaultdict(list)
@@ -113,6 +125,81 @@ async def log_debug(msg: str, channel_id: int = None):
             await channel.send(f"[DEBUG] {full_msg}")
         except Exception as e:
             print(f"[{timestamp}] Fehler beim Senden der Debug-Nachricht: {e}")
+
+
+async def send_with_retry(channel: discord.TextChannel, content: str, channel_id: int, view: View = None):
+    if not content:
+        return
+    try:
+        await channel.send(content, view=view)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+            await log_debug(f"Rate-Limit erreicht, warte {retry_after}s", channel_id)
+            await asyncio.sleep(retry_after)
+            await channel.send(content, view=view)
+        else:
+            await log_debug(f"Discord API Fehler beim Senden: {e}", channel_id)
+    except Exception as e:
+        await log_debug(f"Fehler beim Senden: {e}", channel_id)
+
+
+async def call_grok_api(history: list, channel_id: int) -> Optional[str]:
+    payload = {
+        "model": GROK_MODEL,
+        "messages": history,
+        "max_tokens": GROK_MAX_TOKENS,
+        "temperature": GROK_TEMPERATURE
+    }
+
+    for attempt in range(GROK_MAX_RETRIES + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=GROK_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    "https://api.x.ai/v1/chat/completions",
+                    json=payload,
+                    headers=GROK_HEADERS
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        choices = data.get("choices") or []
+                        if not choices:
+                            await log_debug("KI-API leere Antwort", channel_id)
+                            return None
+                        message = choices[0].get("message") or {}
+                        content = message.get("content")
+                        if not content:
+                            await log_debug("KI-API ohne Content", channel_id)
+                            return None
+                        return content.strip()
+
+                    error_text = await response.text()
+                    await log_debug(
+                        f"KI-API Fehler: {response.status} - {error_text[:200]} (Versuch {attempt + 1})",
+                        channel_id
+                    )
+                    if response.status in (429, 500, 502, 503, 504) and attempt < GROK_MAX_RETRIES:
+                        await asyncio.sleep(GROK_RETRY_DELAY * (attempt + 1))
+                        continue
+                    return None
+        except asyncio.TimeoutError:
+            await log_debug(
+                f"KI-API Timeout nach {GROK_TIMEOUT}s (Versuch {attempt + 1})",
+                channel_id
+            )
+            if attempt < GROK_MAX_RETRIES:
+                await asyncio.sleep(GROK_RETRY_DELAY * (attempt + 1))
+                continue
+            return None
+        except Exception as e:
+            await log_debug(f"KI-Exception: {e} (Versuch {attempt + 1})", channel_id)
+            if attempt < GROK_MAX_RETRIES:
+                await asyncio.sleep(GROK_RETRY_DELAY * (attempt + 1))
+                continue
+            return None
+
+    return None
 
 
 # === RCON API: BAN-CLEAR ===
@@ -886,27 +973,11 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
         ticket_history[channel_id] = history
 
     try:
-        payload = {
-            "model": "grok-4-1-fast-reasoning",
-            "messages": history,
-            "max_tokens": 200,
-            "temperature": 0.8
-        }
-        
-        timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                "https://api.x.ai/v1/chat/completions",
-                json=payload,
-                headers=GROK_HEADERS
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    await log_debug(f"KI-API Fehler: {response.status} - {error_text[:200]}", channel_id)
-                    return
-
-                data = await response.json()
-                bot_reply = data["choices"][0]["message"]["content"].strip()
+        bot_reply = await call_grok_api(history, channel_id)
+        if not bot_reply:
+            await send_with_retry(channel, GROK_FALLBACK_MESSAGE, channel_id)
+            ticket_history[channel_id].append({"role": "assistant", "content": GROK_FALLBACK_MESSAGE})
+            return
 
         user_reply = bot_reply
         admin_summary = ""
@@ -948,18 +1019,7 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
             view.add_item(button)
 
         if user_reply:
-            try:
-                await channel.send(user_reply, view=view if ask_id else None)
-            except discord.HTTPException as e:
-                if e.status == 429:  # Rate limit
-                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
-                    await log_debug(f"Rate-Limit erreicht, warte {retry_after}s", channel_id)
-                    await asyncio.sleep(retry_after)
-                    await channel.send(user_reply, view=view if ask_id else None)
-                else:
-                    await log_debug(f"Discord API Fehler beim Senden: {e}", channel_id)
-            except Exception as e:
-                await log_debug(f"Fehler beim Senden der KI-Antwort: {e}", channel_id)
+            await send_with_retry(channel, user_reply, channel_id, view=view if ask_id else None)
 
         if do_temp_unban:
             player_id = ticket_player_id[channel_id]
@@ -972,15 +1032,17 @@ async def send_ki_response(channel: discord.TextChannel, channel_id: int):
         ticket_history[channel_id].append({"role": "assistant", "content": bot_reply})
 
     except asyncio.TimeoutError:
-        await log_debug(f"KI-API Timeout nach {HTTP_TIMEOUT}s", channel_id)
-        try:
-            await channel.send("⚠️ Die KI braucht gerade etwas länger. Bitte hab einen Moment Geduld.")
-        except:
-            pass
+        await log_debug(f"KI-API Timeout nach {GROK_TIMEOUT}s", channel_id)
+        await send_with_retry(channel, GROK_FALLBACK_MESSAGE, channel_id)
+        ticket_history[channel_id].append({"role": "assistant", "content": GROK_FALLBACK_MESSAGE})
     except KeyError as e:
         await log_debug(f"KI-API Response-Format Fehler: {e}", channel_id)
+        await send_with_retry(channel, GROK_FALLBACK_MESSAGE, channel_id)
+        ticket_history[channel_id].append({"role": "assistant", "content": GROK_FALLBACK_MESSAGE})
     except Exception as e:
         await log_debug(f"KI-Exception: {e}", channel_id)
+        await send_with_retry(channel, GROK_FALLBACK_MESSAGE, channel_id)
+        ticket_history[channel_id].append({"role": "assistant", "content": GROK_FALLBACK_MESSAGE})
 
 
 # === FEEDBACK NACH CLOSE ===
